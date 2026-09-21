@@ -10,9 +10,12 @@ entera en un único `.tpshow`** con los audios dentro: se manda por WhatsApp y f
 máquina. **113 tests en verde** (más 1 ignorado: el de 5 GB).
 
 **Desarrollo completo: todos los hitos cerrados y los huecos técnicos resueltos** (ZIP64
-probado con 5 GB, y guardar una obra abierta desde un paquete). Queda sólo el trabajo de
-publicar, que no es código: compilar el instalador (hace falta NSIS), probarlo en una cuenta
-sin administrador, y subir el release con su código fuente (`08-plan-de-implementacion.md`).
+probado con 5 GB, y guardar una obra abierta desde un paquete).
+
+El guion paso a paso para publicar está en **`Docs/14-como-publicar.md`**: hay un script que
+automatiza tests, release, aviso de terceros, ZIP portable, instalador y el SHA-256 que pide
+winget. Lo que queda a mano es compilar el instalador (hace falta NSIS), probarlo en una
+cuenta sin administrador, y subir el release con su código fuente (obligación GPL-3.0).
 
 > **Validación real (2026-09-20, Windows/WASAPI):** 3 pistas simultáneas durante 300 s sin errores
 > de stream (CPU 7.51 % de un núcleo en debug); fade de 0.1 s y de 60 s sin clics y con la curva exacta
