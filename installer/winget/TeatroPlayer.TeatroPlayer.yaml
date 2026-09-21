@@ -1,0 +1,18 @@
+# Manifiesto winget (T-REL-005).
+#
+# Cómo enviarlo:
+#   1. Bifurca https://github.com/microsoft/winget-pkgs
+#   2. Crea la carpeta
+#        manifests/t/TeatroPlayer/TeatroPlayer/<versión>/
+#   3. Copia ahí estos tres archivos (version, installer, locale).
+#   4. Abre el PR. La validación automática de winget comprueba el SHA-256.
+#
+# El `ProductCode` es el identificador del instalador NSIS; el
+# `InstallerSha256` hay que rellenarlo con el hash del .exe publicado:
+#   (Get-FileHash TeatroPlayer-Instalador.exe -Algorithm SHA256).Hash
+
+PackageIdentifier: TeatroPlayer.TeatroPlayer
+PackageVersion: 0.1.0
+DefaultLocale: es-ES
+ManifestType: version
+ManifestVersion: 1.9.0

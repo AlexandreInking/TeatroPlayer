@@ -1,0 +1,16 @@
+# Compilación
+/target/
+
+# Registros y temporales (la app los crea al lado del ejecutable)
+/logs/
+*.log
+*.tmp
+
+# Obras de ejemplo / pruebas
+*.tpshow
+
+# Acceso directo local (lo genera tools/make_shortcut.py, es de esta máquina)
+*.lnk
+
+# Notas de trabajo del asistente: no son parte del proyecto
+/.workbuddy-ai/

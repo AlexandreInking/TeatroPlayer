@@ -1,0 +1,26 @@
+# Rellenar InstallerSha256 con el hash real del instalador publicado antes de
+# abrir el PR:
+#   (Get-FileHash TeatroPlayer-Instalador.exe -Algorithm SHA256).Hash
+#
+# `Scope: user` es importante: el instalador no pide administrador, así que
+# winget debe saberlo para no lanzar un UAC innecesario.
+
+PackageIdentifier: TeatroPlayer.TeatroPlayer
+PackageVersion: 0.1.0
+Installers:
+  - Architecture: x64
+    InstallerType: nsis
+    InstallerUrl: https://github.com/USUARIO/TeatroPlayer/releases/download/v0.1.0/TeatroPlayer-Instalador.exe
+    InstallerSha256: RELLENAR_CON_EL_HASH_DEL_INSTALADOR
+    Scope: user
+    InstallModes:
+      - silent
+      - silentWithProgress
+    FileExtensions:
+      - tpshow
+PackageLocale: es-ES
+Platform:
+  - Windows.Desktop
+MinimumOSVersion: 10.0.0.0
+ManifestType: installer
+ManifestVersion: 1.9.0

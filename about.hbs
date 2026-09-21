@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<title>Aviso de terceros — TeatroPlayer</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 2rem auto; max-width: 50rem; line-height: 1.5; }
+  h1 { font-size: 1.4rem; }
+  .crate { border-top: 1px solid #ccc; padding: 0.75rem 0; }
+  .crate h2 { font-size: 1.05rem; margin: 0 0 0.25rem; }
+  .meta { color: #555; font-size: 0.9rem; }
+  pre { background: #f4f4f4; padding: 0.75rem; overflow-x: auto; font-size: 0.8rem; }
+</style>
+</head>
+<body>
+
+<h1>Aviso de terceros</h1>
+
+<p>
+  TeatroPlayer es software libre bajo <strong>GNU GPL v3.0</strong>. Este
+  documento cumple el punto «incluir <code>LICENSES/</code> con las licencias de
+  terceros» de <code>Docs/11-open-source-y-licencias.md</code>.
+</p>
+
+<p><strong>{{#each overview}}{{#each counts}}{{count}}{{/each}}{{/each}} dependencias.</strong></p>
+
+{{#each overview}}
+<h2>{{name}} {{version}}</h2>
+<ul>
+{{#each counts}}
+  <li>{{../name}}: {{count}} ({{name}}{{#if licenses}} — {{#each licenses}}{{name}}{{#unless @last}}, {{/unless}}{{/each}}{{/if}})</li>
+{{/each}}
+</ul>
+{{/each}}
+
+{{#each licenses}}
+<div class="crate">
+  <h2>{{#each used_by}}{{#if @first}}{{crate.name}} {{crate.version}}{{/if}}{{/each}}</h2>
+  <p class="meta">{{name}} ({{id}})</p>
+  <pre>{{text}}</pre>
+</div>
+{{/each}}
+
+</body>
+</html>

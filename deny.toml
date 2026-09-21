@@ -1,0 +1,56 @@
+# Política de dependencias (T-OPS-005).
+#
+# TeatroPlayer es GPL-3.0 (`Docs/11`). Eso obliga a que todo lo que se enlace
+# sea **compatible con GPL-3.0**: permisivo (MIT/Apache/BSD/CC0) o copyleft
+# débil tipo MPL-2.0. Una dependencia GPL-incompatible (o directamente cerrada)
+# haría imposible distribuir el binario, así que mejor que lo pare el CI aquí y
+# no un abogado después.
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+ignore = []
+
+[licenses]
+version = 2
+
+# La lista es deliberadamente corta: si algo no está aquí, hay que pensarlo.
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "0BSD",
+    "ISC",
+    "Zlib",
+    "CC0-1.0",
+    # Symphonia (el decodificador que usa rodio) es MPL-2.0: copyleft débil,
+    # compatible con GPL-3.0. Analizado en Docs/11 §3.3.
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "BSL-1.0",
+]
+
+# Se exige licencia explícita: una dependencia sin licencia declarada es un
+# riesgo legal, no un detalle.
+confidence-threshold = 0.9
+
+exceptions = []
+
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"
+allow-wildcard-paths = true
+highlight = "all"
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

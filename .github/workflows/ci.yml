@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  # --- Lo básico: que compile, que pasen los tests, que esté limpio ---------
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Compilar
+        run: cargo build --workspace --all-targets
+
+      - name: Tests
+        run: cargo test --workspace
+        # Los tests que necesitan tarjeta de sonido se omiten solos: comprueban
+        # si hay dispositivo antes de hacer nada. Así esto funciona en CI.
+        env:
+          RUST_BACKTRACE: "1"
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Formato
+        run: cargo fmt --all --check
+
+  # --- T-OPS-005: licencias y procedencia de las dependencias ---------------
+  licenses:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Instalar herramientas
+        run: cargo install --locked cargo-deny cargo-about
+
+      - name: Licencias, duplicados y avisos de seguridad
+        run: cargo deny check licenses bans advisories
+
+      - name: Generar el aviso de terceros
+        run: cargo about generate about.hbs -o THIRD-PARTY.html
+
+      - name: Subir el aviso generado
+        uses: actions/upload-artifact@v4
+        with:
+          name: third-party-notices
+          path: THIRD-PARTY.html

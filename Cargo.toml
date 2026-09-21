@@ -1,0 +1,51 @@
+[package]
+name = "teatroplayer"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.98"
+license = "GPL-3.0-or-later"
+description = "Reproductor de audio para teatro: fade in / fade out / crossfades en tiempo real"
+
+[dependencies]
+# `wav_output` solo lo usa `tp-spike` para renderizar fades a archivo y
+# analizarlos offline; no se enlaza en el ejecutable de release.
+rodio = { version = "0.22", features = ["symphonia-all", "playback", "wav_output"] }
+cpal = "0.17"
+anyhow = "1"
+
+# Interfaz (ADR-001). Sin `default-features` para no arrastrar wgpu, X11 ni
+# Wayland: en Windows solo hace falta glow. `default_fonts` es obligatorio, si
+# no, no se dibuja ni una letra.
+eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts"] }
+# Diálogos nativos de Windows (abrir carpeta / elegir audio). egui no trae.
+rfd = "0.15"
+# Solo escribimos y leemos con método STORE (el audio ya viene comprimido),
+# así que no hace falta ningún compresor: `default-features = false` evita
+# arrastrar zstd, zopfli, bzip2 y compañía.
+zip = { version = "8.6", default-features = false }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+blake3 = "1.8.7"
+tracing = "0.1.44"
+tracing-appender = "0.2.5"
+tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter"] }
+
+[features]
+# Consola visible también en release, para depurar sobre un binario
+# optimizado: `cargo build --release --features dev-console` (T-OPS-004).
+dev-console = []
+
+[[bin]]
+name = "teatroplayer"
+path = "src/main.rs"
+
+[[bin]]
+name = "tp-spike"
+path = "src/bin/spike.rs"
+
+[profile.release]
+opt-level     = "z"
+lto           = true
+codegen-units = 1
+panic         = "abort"
+strip         = true
