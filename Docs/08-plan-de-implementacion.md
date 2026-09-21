@@ -1011,6 +1011,25 @@ powershell -Command "Get-Process -Id $PID | Select-Object MainWindowTitle"
 **Prueba:** PR con una dep de licencia prohibida → CI rojo.
 **Criterio:** verde.
 
+> **Estado: ✅ HECHO y ejecutado (2026-09-21).** Se instalaron las herramientas y se corrieron:
+> ```
+> cargo deny check
+> advisories ok, bans ok, licenses ok, sources ok
+> ```
+> Es decir: **ninguna dependencia con licencia incompatible, ninguna duplicada, ningún aviso de
+> seguridad pendiente y todas proceden de crates.io.**
+>
+> **Y encontró tres fallos en mi propia configuración**, que habrían roto el CI en el primer push:
+> 1. **`GPL-3.0-or-later` estaba rechazada**: cargo-deny comprueba también el paquete raíz y no
+>    había incluido nuestra propia licencia en la lista permitida. El proyecto no pasaba su propia
+>    comprobación.
+> 2. **Las fuentes que egui incrusta** (`default_fonts`, imprescindible para dibujar texto) traen
+>    `OFL-1.1` y `Ubuntu-font-1.0`, que tampoco estaban permitidas. Son licencias de fuentes libres
+>    según la FSF; se permiten y quedan documentadas en `Docs/11`.
+> 3. `Unicode-DFS-2016` no la usaba nadie: fuera, para no ensuciar.
+>
+> Para esto sirve el control: **mejor encontrarlo aquí que en un release ya publicado.**
+
 > **Estado: ✅ HECHO (2026-09-21) como configuración; pendiente de ejecutar en CI.**
 >
 > - `.github/workflows/ci.yml`: build + tests + clippy + `cargo fmt --check` en Windows y Linux, y un

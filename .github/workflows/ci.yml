@@ -46,7 +46,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Instalar herramientas
-        run: cargo install --locked cargo-deny cargo-about
+        # Ojo: cargo-about no instala su binario sin la feature `cli`, y
+        # cargo-deny tarda un rato en compilar. Se hace en un paso aparte para
+        # que un fallo aquí no tumbe los tests.
+        run: |
+          cargo install --locked cargo-deny
+          cargo install --locked cargo-about --features cli
 
       - name: Licencias, duplicados y avisos de seguridad
         run: cargo deny check licenses bans advisories

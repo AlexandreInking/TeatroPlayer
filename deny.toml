@@ -18,6 +18,9 @@ version = 2
 
 # La lista es deliberadamente corta: si algo no está aquí, hay que pensarlo.
 allow = [
+    # La nuestra: cargo-deny comprueba también el paquete raíz, y sin esto el
+    # proyecto no pasaría su propia comprobación.
+    "GPL-3.0-or-later",
     "MIT",
     "MIT-0",
     "Apache-2.0",
@@ -32,8 +35,12 @@ allow = [
     # compatible con GPL-3.0. Analizado en Docs/11 §3.3.
     "MPL-2.0",
     "Unicode-3.0",
-    "Unicode-DFS-2016",
     "BSL-1.0",
+    # egui incrusta fuentes (feature `default_fonts`, necesario para que se
+    # dibuje una sola letra). Son licencias de fuentes libres según la FSF, y
+    # el aviso de terceros las incluye. Conviene tenerlo presente al distribuir.
+    "OFL-1.1",
+    "Ubuntu-font-1.0",
 ]
 
 # Se exige licencia explícita: una dependencia sin licencia declarada es un

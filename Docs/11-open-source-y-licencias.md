@@ -51,12 +51,35 @@ En la práctica esto desarma el modelo de "build privado exclusivo": en el momen
 - [ ] Publicar el **código fuente completo correspondiente** (repo + tag del commit exacto) en el mismo release. Un enlace al repo alcanza si el tag es inequívoco.
 - [ ] Aviso prominente en el README y en "Acerca de": copyright, GPL-3.0, "sin garantía" (§15/§16).
 - [ ] Si se modificó respecto de una versión anterior, indicarlo con fecha (§5(a)).
-- [ ] Incluir `LICENSES/` con las licencias de terceros (MIT, Apache-2.0, MPL-2.0).
+- [x] Incluir el aviso de terceros: se genera con `cargo about generate about.hbs` y queda en `THIRD-PARTY.html` (MIT, Apache-2.0, MPL-2.0 y demás).
+- [x] Verificar la cadena de dependencias: `cargo deny check` pasa entero (licencias, duplicados, avisos de seguridad y orígenes). Detalles en §6.
 - [ ] **No** añadir restricciones extra: ni "no comercial", ni EULA, ni cláusulas de uso.
 - [ ] **No** exigir regalías ni patentes por encima de la licencia (§10: al distribuir bajo GPL-3.0 se concede automáticamente licencia de patente a los receptores).
 - [ ] "Installation information" (§6): solo aplica a productos de consumo cerrados. Una laptop no lo es — no aplica.
 
 ## 6. Compatibilidad de la cadena de dependencias
+
+Verificado con `cargo deny check` (2026-09-21): **advisories ok, bans ok, licenses ok, sources ok.**
+Ninguna dependencia incompatible, ninguna duplicada, ningún aviso de seguridad pendiente.
+
+Lo que hay en el árbol, por licencia:
+
+| Licencia | Viene de | Compatible con GPL-3.0 |
+|---|---|---|
+| MIT / MIT-0 / Apache-2.0 / BSD / ISC / Zlib / CC0-1.0 / 0BSD / BSL-1.0 / Unicode-3.0 | casi todo el árbol | Sí, permisivas |
+| **MPL-2.0** | Symphonia (el decodificador de rodio) | Sí, copyleft débil sólo a nivel de fichero (§3.3) |
+| **OFL-1.1** y **Ubuntu-font-1.0** | las fuentes que egui incrusta (`default_fonts`) | Libres según la FSF |
+| GPL-3.0-or-later | TeatroPlayer | Nuestra |
+
+**Dos avisos que salieron de ejecutar la herramienta** (y que no se habrían visto a ojo):
+
+1. **Había que permitir nuestra propia licencia.** cargo-deny comprueba también el paquete raíz,
+   así que sin `GPL-3.0-or-later` en la lista el proyecto no pasaba su propia comprobación.
+2. **El binario lleva fuentes incrustadas** con `OFL-1.1` y `Ubuntu-font-1.0`. Es lo que permite
+   dibujar texto sin depender de las fuentes del sistema (un acierto para un equipo de teatro),
+   pero significa que esas licencias viajan dentro del ejecutable. Están admitidas y aparecen en
+   `THIRD-PARTY.html`. Si algún día se quiere evitar, habría que desactivar `default_fonts` y
+   cargar unas fuentes propias en tiempo de arranque, con el riesgo de que falten en el equipo.
 
 | Dependencia | Licencia | ¿Compatible con GPL-3.0? |
 |---|---|---|
