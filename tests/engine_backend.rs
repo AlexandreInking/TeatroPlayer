@@ -172,6 +172,8 @@ fn cuatro_pistas_a_la_vez_con_fades_a_distintos_tiempos() {
         spec.entrance = Entrance::FadeIn {
             duration: Duration::from_millis(200),
             curve: Default::default(),
+            from_percent: 0,
+            to_percent: 100,
         };
         handles.push(
             backend

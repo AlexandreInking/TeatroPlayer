@@ -32,6 +32,7 @@ use teatroplayer::engine::model::{
     AudioSource, CueSpec, Curve, Entrance, ExitMode, EXTENSIONES_AUDIO, LoopMode, MilliDb,
     OnPrevious,
 };
+use teatroplayer::eventos::{Evento, PistaEvento, TipoEvento, BUCLE_INFINITO};
 use teatroplayer::sesion::links;
 use teatroplayer::sesion::modelo::{AutoFollow, AudioRef};
 use teatroplayer::sesion::{AutoSaver, Cue, Historial, ModoApertura, Sesion};
@@ -58,6 +59,17 @@ const STOP_RED: egui::Color32 = egui::Color32::from_rgb(0xFF, 0x4D, 0x4D);
 const WARN_AMBER: egui::Color32 = egui::Color32::from_rgb(0xFF, 0xB0, 0x20);
 const DUCK_ORANGE: egui::Color32 = egui::Color32::from_rgb(0xEF, 0x9F, 0x27);
 
+/// Paleta de 6 colores para los eventos, distinta de la de los audios: así se
+/// distingue de un vistazo si lo que se mira es un archivo o una escena.
+const EVENT_COLORS: [egui::Color32; 6] = [
+    egui::Color32::from_rgb(0x5D, 0xBE, 0x6F),
+    egui::Color32::from_rgb(0x38, 0xB5, 0xA6),
+    egui::Color32::from_rgb(0x4F, 0x8F, 0xE0),
+    egui::Color32::from_rgb(0x7B, 0x6F, 0xE0),
+    egui::Color32::from_rgb(0xC5, 0x6F, 0xD0),
+    egui::Color32::from_rgb(0xE8, 0x8C, 0x39),
+];
+
 /// Paleta de 8 colores para las entradas, asignada en orden de creación.
 const CUE_COLORS: [egui::Color32; 8] = [
     egui::Color32::from_rgb(0xE0, 0x48, 0x48),
@@ -74,31 +86,38 @@ const CUE_COLORS: [egui::Color32; 8] = [
 // empaquetador y la interfaz usen exactamente la misma lista.
 
 // ---------------------------------------------------------------------------
-// Modelo de la interfaz
+// Las dos listas del panel central
 // ---------------------------------------------------------------------------
-
-// El modo y su bloqueo viven en `teatroplayer::show` para poder testearlos sin
-// abrir una ventana (T-SHOW-001).
+//
+// En una van los **audios**: los archivos sueltos de la obra. En la otra, los
+// **eventos**: escenas montadas con uno o dos de esos audios y una rampa de
+// volumen entre dos porcentajes. Son dos cosas distintas y por eso van en dos
+// listas separadas y no mezcladas: el audio es el material, el evento es lo
+// que se lanza en la función.
+//
+// El panel de la derecha deja de tener pestañas: era lo que obligaba a poner
+// iconos crípticos en un panel estrecho. Ahora es una columna con scroll donde
+// todo se ve a la vez, que es lo que hace falta para ajustar una escena.
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
-enum Tab {
+enum ListaTab {
     #[default]
-    Entrada,
-    Anterior,
-    Salida,
-    Repeticion,
-    Volumen,
+    Audios,
+    Eventos,
 }
 
-impl Tab {
-    const TODOS: [Tab; 5] = [Tab::Entrada, Tab::Anterior, Tab::Salida, Tab::Repeticion, Tab::Volumen];
+impl ListaTab {
     fn rotulo(self) -> &'static str {
         match self {
-            Tab::Entrada => "Cómo entra",
-            Tab::Anterior => "Lo anterior",
-            Tab::Salida => "Cómo sale",
-            Tab::Repeticion => "Repetición",
-            Tab::Volumen => "Volumen",
+            ListaTab::Audios => "Audios",
+            ListaTab::Eventos => "Eventos",
+        }
+    }
+
+    fn icono(self) -> IconKind {
+        match self {
+            ListaTab::Audios => IconKind::AnadirAudio,
+            ListaTab::Eventos => IconKind::Cruce,
         }
     }
 }
@@ -187,6 +206,91 @@ impl Entrada {
     }
 }
 
+/// Un evento en vivo: el evento guardado más las pistas que estén sonando.
+///
+/// Va aparte de [`Evento`] por el mismo motivo que `Entrada` no es `Cue`: el
+/// modelo se serializa, las pistas en curso no.
+struct EventoVivo {
+    evento: Evento,
+    /// Pista en curso de cada hueco de audio.
+    ///
+    /// `None` en un hueco significa "este hueco no suena por sí mismo": o está
+    /// vacío, o ya estaba sonando como entrada y el evento se limitó a bajarla
+    /// (el caso del crossfade sobre un ambiente que ya suena).
+    pistas: Vec<Option<Box<dyn TrackHandle>>>,
+    /// true si algún audio del evento no está en la lista de audios.
+    falta: bool,
+}
+
+impl EventoVivo {
+    fn nuevo(evento: Evento) -> Self {
+        let huecos = evento.pistas.len();
+        // `vec![None; n]` no sirve: `Box<dyn TrackHandle>` no es `Clone`, y no
+        // tiene por qué serlo (una pista en curso no se debe duplicar).
+        Self { evento, pistas: (0..huecos).map(|_| None).collect(), falta: false }
+    }
+
+    fn sonando(&self) -> bool {
+        self.pistas
+            .iter()
+            .any(|p| p.as_ref().is_some_and(|t| !t.state().is_done()))
+    }
+
+    fn parar(&mut self) {
+        for p in self.pistas.iter_mut().flatten() {
+            p.stop();
+        }
+        for p in self.pistas.iter_mut() {
+            *p = None;
+        }
+    }
+
+    /// Suelta las pistas que ya terminaron, para no contarlas como sonando.
+    fn limpiar_terminadas(&mut self) {
+        for p in self.pistas.iter_mut() {
+            if p.as_ref().is_some_and(|t| t.state().is_done()) {
+                *p = None;
+            }
+        }
+    }
+}
+
+/// Foto del estado para deshacer: entradas **y** eventos.
+#[derive(Clone, Default)]
+struct Instantanea {
+    filas: Vec<Fila>,
+    eventos: Vec<Evento>,
+}
+
+/// A qué se le está editando la tecla y el pad: a un audio o a un evento.
+///
+/// Los dos tienen tecla y pad, así que el editor es el mismo y sólo cambia
+/// dónde se guarda. El `sal` distingue los combo boxes de uno y de otro, que si
+/// no compartirían id dentro de egui y se pisarían.
+#[derive(Clone, Copy)]
+enum Objeto {
+    Audio(usize),
+    Evento(usize),
+}
+
+impl Objeto {
+    fn sal(self) -> &'static str {
+        match self {
+            Objeto::Audio(_) => "audio",
+            Objeto::Evento(_) => "evento",
+        }
+    }
+}
+
+/// Asistente para crear un evento: primero el tipo, luego los audios.
+struct Asistente {
+    /// 0 = elegir el tipo, 1 = elegir los audios.
+    paso: usize,
+    tipo: TipoEvento,
+    /// Índice del audio elegido para cada hueco, dentro de `self.entradas`.
+    elegidos: Vec<Option<usize>>,
+}
+
 struct App {
     backend: Arc<RodioBackend>,
     salidas: Vec<OutputInfo>,
@@ -194,9 +298,15 @@ struct App {
 
     entradas: Vec<Entrada>,
     seleccionada: Option<usize>,
+    /// Eventos predefinidos de la obra.
+    eventos: Vec<EventoVivo>,
+    evento_sel: Option<usize>,
+    /// Qué lista se ve en el panel central.
+    lista: ListaTab,
+    /// Ventana paso a paso para crear un evento. `None` = cerrada.
+    asistente: Option<Asistente>,
     /// Modo y bloqueo de edición (T-SHOW-001).
     bloqueo: Bloqueo,
-    tab: Tab,
     /// Dispara la entrada siguiente cuando toca (T-SHOW-002).
     programador: Programador,
 
@@ -221,11 +331,20 @@ struct App {
     /// Última entrada disparada, para que Espacio lance la siguiente (T-UI-007).
     ultima_disparada: Option<usize>,
     /// Instantáneas para Ctrl+Z / Ctrl+Shift+Z (T-UI-008).
-    historial: Historial<Vec<Fila>>,
+    historial: Historial<Instantanea>,
     /// Obra que hay que abrir en cuanto arranque la ventana: llega de la línea
     /// de comandos, que es lo que pasa Windows al hacer doble clic en un
     /// `.tpshow` una vez asociada la extensión (T-REL-004).
     pendiente_abrir: Option<PathBuf>,
+    /// Cuántos frames lleva pintados.
+    frames: u32,
+    /// Frame en el que empezó la última pulsación del ratón.
+    ///
+    /// Sirve para descartar el clic que **ya venía en vuelo** cuando la ventana
+    /// se abrió: si la pulsación empezó antes de que esta ventana existiera, el
+    /// soltar no cuenta como un clic del operador. Sin esto, abrir el programa
+    /// con el ratón pulsado en cualquier sitio cambiaba de lista solo.
+    frame_pulsacion: Option<u32>,
 }
 
 impl App {
@@ -236,8 +355,11 @@ impl App {
             elegida: 0,
             entradas: Vec::new(),
             seleccionada: None,
+            eventos: Vec::new(),
+            evento_sel: None,
+            lista: ListaTab::Audios,
+            asistente: None,
             bloqueo: Bloqueo::nuevo(),
-            tab: Tab::Entrada,
             programador: Programador::nuevo(),
             ruta: None,
             sucio: false,
@@ -253,6 +375,8 @@ impl App {
             ultima_disparada: None,
             historial: Historial::nuevo(50),
             pendiente_abrir: None,
+            frames: 0,
+            frame_pulsacion: None,
         }
     }
 
@@ -306,25 +430,30 @@ impl App {
     }
 
     /// Foto del estado editable, para el historial.
-    fn instantanea(&self) -> Vec<Fila> {
-        self.entradas
-            .iter()
-            .map(|e| Fila {
-                nombre: e.nombre.clone(),
-                spec: e.spec.clone(),
-                auto_follow: e.auto_follow,
-                tecla: e.tecla.clone(),
-                pad: e.pad,
-                audio: e.audio.clone(),
-                fuente: e.fuente.clone(),
-                falta: e.falta,
-            })
-            .collect()
+    fn instantanea(&self) -> Instantanea {
+        Instantanea {
+            filas: self
+                .entradas
+                .iter()
+                .map(|e| Fila {
+                    nombre: e.nombre.clone(),
+                    spec: e.spec.clone(),
+                    auto_follow: e.auto_follow,
+                    tecla: e.tecla.clone(),
+                    pad: e.pad,
+                    audio: e.audio.clone(),
+                    fuente: e.fuente.clone(),
+                    falta: e.falta,
+                })
+                .collect(),
+            eventos: self.eventos.iter().map(|v| v.evento.clone()).collect(),
+        }
     }
 
     /// Vuelve a una foto. Las posiciones que siguen existiendo **conservan su
     /// pista en curso**: deshacer no debe cortar lo que está sonando.
-    fn aplicar_instantanea(&mut self, filas: Vec<Fila>) {
+    fn aplicar_instantanea(&mut self, instanta: Instantanea) {
+        let filas = instanta.filas;
         let total = filas.len();
         for (i, f) in filas.into_iter().enumerate() {
             if let Some(e) = self.entradas.get_mut(i) {
@@ -355,6 +484,28 @@ impl App {
         self.entradas.truncate(total);
         if self.seleccionada.is_some_and(|i| i >= self.entradas.len()) {
             self.seleccionada = None;
+        }
+
+        // Los eventos, igual: se cambia la configuración pero no se corta lo
+        // que esté sonando de ese evento.
+        let total_eventos = instanta.eventos.len();
+        for (i, evento) in instanta.eventos.into_iter().enumerate() {
+            match self.eventos.get_mut(i) {
+                Some(vivo) => {
+                    // Si cambia el número de huecos (por ejemplo, de fade in a
+                    // crossfade), las pistas en curso dejan de cuadrar.
+                    if vivo.pistas.len() != evento.pistas.len() {
+                        vivo.parar();
+                        vivo.pistas = (0..evento.pistas.len()).map(|_| None).collect();
+                    }
+                    vivo.evento = evento;
+                }
+                None => self.eventos.push(EventoVivo::nuevo(evento)),
+            }
+        }
+        self.eventos.truncate(total_eventos);
+        if self.evento_sel.is_some_and(|i| i >= self.eventos.len()) {
+            self.evento_sel = None;
         }
     }
 
@@ -449,8 +600,17 @@ impl App {
     // --- sesión ------------------------------------------------------------
 
     fn obra_nueva(&mut self) {
+        for e in &mut self.entradas {
+            if let Some(p) = e.pista.take() {
+                p.stop();
+            }
+        }
         self.entradas.clear();
         self.seleccionada = None;
+        self.eventos.clear();
+        self.evento_sel = None;
+        self.asistente = None;
+        self.lista = ListaTab::Audios;
         self.ruta = None;
         self.sucio = false;
         self.solo_lectura = false;
@@ -485,6 +645,7 @@ impl App {
         let dentro = teatroplayer::paquete::lista_audios(&ruta).unwrap_or_default();
 
         self.entradas.clear();
+        self.eventos.clear();
         for (i, cue) in sesion.cues.iter().enumerate() {
             let entrada = format!("audio/{}", cue.audio.file_name);
             // Sin nombre de archivo no hay nada que buscar: la fila sale
@@ -507,20 +668,148 @@ impl App {
             });
         }
 
+        // Los eventos se cargan después de los audios: cada evento guarda el
+        // `fileName` de sus audios y hay que poder comprobar que siguen ahí.
+        self.eventos = sesion.eventos.iter().map(|e| self.cargar_evento(e)).collect();
+        self.refrescar_falta_eventos();
+
         let cuantos = self.entradas.len();
         let faltantes = self.entradas.iter().filter(|e| e.falta).count();
+        let eventos_sin_audio = self.eventos.iter().filter(|v| v.falta).count();
         self.seleccionada = if cuantos > 0 { Some(0) } else { None };
+        self.evento_sel = if self.eventos.is_empty() { None } else { Some(0) };
         self.solo_lectura = modo == ModoApertura::SoloLectura;
         self.ruta = Some(ruta.clone());
         self.sucio = false;
 
-        self.anotar(format!("abierta {} ({} entradas)", ruta.display(), cuantos));
+        self.anotar(format!(
+            "abierta {} ({} audios, {} eventos)",
+            ruta.display(),
+            cuantos,
+            self.eventos.len()
+        ));
         if faltantes > 0 {
             self.anotar(format!("AVISO: {faltantes} audios no están en el paquete"));
+        }
+        if eventos_sin_audio > 0 {
+            self.anotar(format!(
+                "AVISO: {eventos_sin_audio} eventos usan audios que no están en la obra"
+            ));
         }
         if self.solo_lectura {
             self.anotar("AVISO: es de una versión más nueva; se abre sólo para mirar");
         }
+    }
+
+    /// Pone un evento en la lista, sin pistas en curso todavía.
+    fn cargar_evento(&self, evento: &Evento) -> EventoVivo {
+        EventoVivo::nuevo(evento.clone())
+    }
+
+    /// Marca los eventos cuyo audio ya no está en la lista de audios.
+    ///
+    /// Un evento no guarda el archivo, sino el `fileName` del audio con el que
+    /// se montó: si ese audio deja de estar en la obra (se quitó, se renombró),
+    /// el evento se ve como incompleto en vez de fallar al lanzarlo.
+    fn refrescar_falta_eventos(&mut self) {
+        for vivo in &mut self.eventos {
+            vivo.falta = vivo.evento.pistas.iter().any(|p| {
+                !p.vacio()
+                    && !self
+                        .entradas
+                        .iter()
+                        .any(|e| e.audio.file_name == p.audio.file_name)
+            });
+        }
+    }
+
+    /// ¿Se puede dar por bueno un clic del ratón ahora mismo?
+    ///
+    /// Es falso mientras la única pulsación vista sea la que **ya venía en
+    /// vuelo** al abrirse la ventana: la que abrió el programa desde el acceso
+    /// directo o la que manda el sistema al dar el foco. Esa pulsación no es
+    /// del operador, y si el ratón estaba justo encima de un botón, el soltar
+    /// se interpreta como un clic y acciona lo que hubiera debajo.
+    ///
+    /// Se usa en los sitios donde un clic fantasma hace daño: cambiar de lista
+    /// o tirar la obra con "Nueva". En un botón de GO el daño sería sonar algo
+    /// que nadie pidió, así que ahí también vale la pena.
+    fn clic_fiable(&self) -> bool {
+        self.frame_pulsacion.is_some_and(|f| f > 1)
+    }
+
+    /// Abre el asistente de creación de eventos.
+    fn abrir_asistente(&mut self) {
+        self.asistente = Some(Asistente {
+            paso: 0,
+            tipo: TipoEvento::FadeIn,
+            elegidos: vec![None],
+        });
+        self.anotar("asistente: elige el tipo de evento");
+    }
+
+    /// Quita un evento. No corta lo que esté sonando de los demás.
+    fn quitar_evento(&mut self, i: usize) {
+        self.historial.registrar(&self.instantanea());
+        if let Some(v) = self.eventos.get_mut(i) {
+            v.parar();
+        }
+        self.eventos.remove(i);
+        self.sucio = true;
+        self.auto.pedir();
+        if self.evento_sel == Some(i) {
+            self.evento_sel = None;
+        } else if let Some(s) = self.evento_sel {
+            if s > i {
+                self.evento_sel = Some(s - 1);
+            }
+        }
+    }
+
+    fn mover_evento(&mut self, i: usize, delta: isize) {
+        self.historial.registrar(&self.instantanea());
+        let destino = i as isize + delta;
+        if destino < 0 || destino >= self.eventos.len() as isize {
+            return;
+        }
+        self.eventos.swap(i, destino as usize);
+        self.sucio = true;
+        self.auto.pedir();
+        if self.evento_sel == Some(i) {
+            self.evento_sel = Some(destino as usize);
+        }
+    }
+
+    /// Alarga o acorta la escena sin tocar nada más de su configuración.
+    ///
+    /// Es el ajuste que se hace sobre la marcha: los audios, la curva, el
+    /// volumen y el bucle se quedan exactamente como estaban.
+    fn ajustar_duracion_evento(&mut self, i: usize, delta_ms: i64) {
+        let Some(v) = self.eventos.get(i) else { return };
+        let antes = v.evento.duracion_ms;
+        let nueva = (antes as i64 + delta_ms).clamp(100, 600_000) as u64;
+        if nueva == antes {
+            return;
+        }
+        let nombre = v.evento.nombre.clone();
+        // No se registra en el historial: es un ajuste fino, y en Función
+        // deshacer por accidente sería peor que no deshacer.
+        self.eventos[i].evento.duracion_ms = nueva;
+        self.anotar(format!(
+            "'{nombre}': {} → {}",
+            formatear(Duration::from_millis(antes)),
+            formatear(Duration::from_millis(nueva))
+        ));
+        self.sucio = true;
+        self.auto.pedir();
+    }
+
+    /// El audio de la lista al que apunta un hueco de un evento.
+    fn fuente_de_evento(&self, pista: &PistaEvento) -> Option<Fuente> {
+        self.entradas
+            .iter()
+            .find(|e| !e.audio.file_name.is_empty() && e.audio.file_name == pista.audio.file_name)
+            .map(|e| e.fuente.clone())
     }
 
     /// Construye la `Sesion` a partir de lo que hay en pantalla.
@@ -548,6 +837,7 @@ impl App {
                     pad: e.pad,
                 })
                 .collect(),
+            eventos: self.eventos.iter().map(|v| v.evento.clone()).collect(),
         }
     }
 
@@ -635,6 +925,8 @@ impl App {
             }
         }
         self.entradas.remove(i);
+        // Un evento que usara este audio se queda sin él: hay que decirlo.
+        self.refrescar_falta_eventos();
         self.sucio = true;
         self.auto.pedir();
         if self.seleccionada == Some(i) {
@@ -662,8 +954,14 @@ impl App {
 
     // --- transporte -------------------------------------------------------
 
-    /// GO: aplica `on_previous` a lo que esté sonando y suena esta entrada.
-    fn ir(&mut self, i: usize) {
+/// GO: aplica `on_previous` a lo que esté sonando y suena esta entrada.
+///
+/// Si la entrada tiene un `on_previous::FadeOut { gap }`, en vez de sonar
+/// ahora se agenda: primero sale la anterior y, cuando termina su fade,
+/// esperamos `gap` milisegundos y entonces suena esta. Es la receta "B
+/// entra X segundos después de que A haya terminado su fade out" del
+/// usuario, sin que el operador tenga que contar.
+fn ir(&mut self, i: usize) {
         let Some(entrada) = self.entradas.get(i) else { return };
         if entrada.falta {
             self.anotar(format!("FALTA EL AUDIO de '{}'", entrada.nombre));
@@ -671,6 +969,8 @@ impl App {
         }
         let spec = entrada.spec.clone();
         let fuente = entrada.fuente.clone();
+        let nombre = entrada.nombre.clone();
+        let ahora = self.arranque.elapsed().as_millis() as u64;
 
         // 1. Qué pasa con lo que ya sonaba. `entrance` y `on_previous` son
         //    independientes: eso es lo que permite todas las combinaciones.
@@ -685,7 +985,7 @@ impl App {
             match spec.on_previous {
                 OnPrevious::Keep => {}
                 OnPrevious::Stop => p.stop(),
-                OnPrevious::FadeOut { duration, curve } => p.stop_after(duration, curve),
+                OnPrevious::FadeOut { duration, curve, .. } => p.stop_after(duration, curve),
                 OnPrevious::Duck { duration, curve, level_percent } => {
                     p.fade_to(level_percent as f32 / 100.0, duration, curve);
                     e.duck = true;
@@ -693,10 +993,37 @@ impl App {
             }
         }
 
-        // 2. Suena esta.
+        // 2. ¿Hay retardo? Si lo hay, agendamos en vez de sonar ya.
+        //    Sólo se retrasa cuando hay una pista sonando: si la sala está
+        //    en silencio, no tiene sentido esperar al "fade out" de nadie.
+        let retardo = match spec.on_previous {
+            OnPrevious::FadeOut { duration, gap, .. } => {
+                let sonando = self.entradas.iter().any(|e| e.sonando());
+                if sonando {
+                    duration + gap
+                } else {
+                    Duration::ZERO
+                }
+            }
+            _ => Duration::ZERO,
+        };
+
+        if retardo > Duration::ZERO {
+            let disparar_en = ahora + retardo.as_millis() as u64;
+            self.programador.demorar_entrada(i, disparar_en);
+            self.anotar(format!(
+                "GO demorado: '{}' sonará en {} ms (al terminar el fade out)",
+                nombre,
+                retardo.as_millis()
+            ));
+            self.ultima_disparada = Some(i);
+            self.seleccionada = Some(i);
+            return;
+        }
+
+        // 3. Suena esta.
         match self.backend.play(&spec, fuente.como_audio_source()) {
             Ok(pista) => {
-                let nombre = self.entradas[i].nombre.clone();
                 self.anotar(format!("GO: {nombre}"));
                 self.ultima_disparada = Some(i);
 
@@ -704,7 +1031,6 @@ impl App {
                 // sola, se programa aquí (T-SHOW-002).
                 let follow = self.entradas[i].auto_follow;
                 let hay_siguiente = i + 1 < self.entradas.len();
-                let ahora = self.arranque.elapsed().as_millis() as u64;
                 if self.programador.al_arrancar(i, follow, ahora, hay_siguiente) {
                     self.anotar(format!(
                         "auto: la entrada {} arrancará {}",
@@ -725,6 +1051,117 @@ impl App {
         }
     }
 
+    /// Lanza un evento: monta la escena tal como está guardada.
+    ///
+    /// No hay que volver a configurar nada para acortar o alargar la escena: el
+    /// evento se lee tal cual está en ese momento, así que cambiar su duración
+    /// surte efecto en el siguiente lanzamiento.
+    fn ir_evento(&mut self, i: usize) {
+        let Some(vivo) = self.eventos.get(i) else { return };
+        let evento = vivo.evento.clone();
+
+        if !evento.completo() {
+            self.anotar(format!(
+                "'{}' está a medias: le falta(n) {} audio(s)",
+                evento.nombre,
+                evento.huecos_sin_audio()
+            ));
+            return;
+        }
+        if vivo.falta {
+            self.anotar(format!("FALTA EL AUDIO de '{}'", evento.nombre));
+            return;
+        }
+
+        // Relanzar un evento que ya está sonando lo reinicia: no se montan dos
+        // copias del mismo audio encima.
+        self.eventos[i].parar();
+
+        let duracion = evento.duracion();
+        let curva = evento.curva;
+
+        // 1. Lo que sale. Sólo el crossfade y el fade out tocan lo que ya
+        //    suena; un fade in o un disparo único se montan encima y no apagan
+        //    nada. En los dos que sí actúan, el audio de base **no se elige**:
+        //    es el que está sonando ahora mismo, así que se recorre lo que suena
+        //    y se le aplica la rampa hacia su volumen objetivo. Si el objetivo
+        //    es 0, la pista se apaga y se corta.
+        let mut bajadas = 0;
+        if evento.tipo.actua_sobre_lo_que_suena() {
+            bajadas = self.bajar_lo_que_suena(evento.salida_pct, duracion, curva);
+            if bajadas == 0 {
+                self.anotar(format!(
+                    "'{}': no hay nada sonando, no hay nada que bajar",
+                    evento.nombre
+                ));
+            } else {
+                self.anotar(format!("  · {bajadas} pista(s) → {} %", evento.salida_pct));
+            }
+        }
+
+        // 2. Lo que entra. Sólo los tipos de entrada traen audio propio.
+        let mut entra = false;
+        if let Some(spec) = evento.spec_entrada() {
+            if let Some(pista) = evento.pistas.first() {
+                let nombre = pista.nombre.clone();
+                match self.fuente_de_evento(pista) {
+                    Some(fuente) => match self.backend.play(&spec, fuente.como_audio_source()) {
+                        Ok(handle) => {
+                            self.eventos[i].pistas[0] = Some(handle);
+                            entra = true;
+                            self.anotar(format!("  · {nombre}"));
+                        }
+                        Err(e) => {
+                            self.anotar(format!("no se pudo reproducir '{nombre}': {e}"))
+                        }
+                    },
+                    None => self.anotar(format!("FALTA EL AUDIO '{nombre}' en la lista")),
+                }
+            }
+        }
+
+        if entra || bajadas > 0 {
+            let rotulo = match evento.tipo {
+                TipoEvento::Golpe => "GOLPE",
+                TipoEvento::FadeOut => "FADE OUT",
+                _ => "EVENTO",
+            };
+            self.anotar(format!("{rotulo}: {} ({})", evento.nombre, evento.resumen()));
+            self.evento_sel = Some(i);
+        }
+    }
+
+    /// Aplica la rampa de salida a **lo que está sonando** y devuelve cuántas
+    /// pistas ha movido.
+    ///
+    /// Es el lado que sale de un crossfade y el protagonista de un fade out:
+    /// ninguno de los dos elige el audio, porque el que se va es el que ya
+    /// está sonando. Su punto de partida es "donde esté sonando ahora", que no
+    /// se sabe hasta que se lanza el evento; lo único configurable es el
+    /// volumen al que llega.
+    ///
+    /// Si el objetivo es 0, la pista se apaga y **se corta** al terminar: sin
+    /// el corte seguiría ocupando el mezclador en silencio hasta el final del
+    /// archivo. El corte cae cuando la ganancia ya es 0, así que no se oye.
+    fn bajar_lo_que_suena(&mut self, objetivo_pct: u8, duracion: Duration, curva: Curve) -> usize {
+        let objetivo = objetivo_pct as f32 / 100.0;
+        let mut cuantas = 0;
+
+        for e in &mut self.entradas {
+            let Some(p) = e.pista.as_ref() else { continue };
+            if p.state().is_done() {
+                continue;
+            }
+            if objetivo <= 0.0 {
+                p.stop_after(duracion, curva);
+            } else {
+                p.fade_to(objetivo, duracion, curva);
+            }
+            cuantas += 1;
+        }
+        cuantas
+    }
+
     /// Parada de emergencia (T-SHOW-003): fade corto y corte.
     ///
     /// El fade no es un adorno: cortar un PCM a mitad de ciclo se oye como un
@@ -738,6 +1175,9 @@ impl App {
                 p.stop();
             }
             e.duck = false;
+        }
+        for v in &mut self.eventos {
+            v.parar();
         }
         self.backend.stop_all();
         self.anotar(format!(
@@ -764,6 +1204,9 @@ impl App {
                 e.pista = None;
             }
         }
+        for v in &mut self.eventos {
+            v.limpiar_terminadas();
+        }
     }
 }
 
@@ -786,6 +1229,29 @@ fn es_audio(p: &Path) -> bool {
 enum IconKind {
     Nueva, Abrir, Guardar, AnadirAudio, Registro,
     Subir, Bajar, Quitar, Probar,
+    /// Rampa que sube: "entra con fade".
+    Entrada,
+    /// Dos rampas cruzadas: "sale la anterior mientras entra esta".
+    Cruce,
+    /// Rampa que baja: "sale con fade".
+    Salida,
+    /// Flecha con barra: "arranca la siguiente".
+    Siguiente,
+    /// Circuito cerrado: "en loop".
+    Loop,
+    /// Altavoz: volumen.
+    Volumen,
+    /// Reloj: espera.
+    Espera,
+    /// Rayo: disparo único, un efecto de golpe.
+    Rayo,
+    /// Más y menos: acortar o alargar una escena.
+    Mas,
+    Menos,
+    /// Lápiz: el evento se puede editar sobre la marcha.
+    Editar,
+    /// Teclas: cómo se dispara a mano.
+    Teclado,
 }
 
 fn dibujar_icono(painter: &egui::Painter, rect: egui::Rect, kind: IconKind, color: egui::Color32) {
@@ -793,6 +1259,7 @@ fn dibujar_icono(painter: &egui::Painter, rect: egui::Rect, kind: IconKind, colo
     let fill = color;
     let c = rect.center();
     let w = rect.width();
+    let h = rect.height();
     let tl = rect.left_top();
     let br = rect.right_bottom();
     match kind {
@@ -918,6 +1385,79 @@ fn dibujar_icono(painter: &egui::Painter, rect: egui::Rect, kind: IconKind, colo
                 stroke,
             );
         }
+        // Una rampa que sube, con punta de flecha. Es la forma del fade in.
+        IconKind::Entrada => {
+            let o = egui::pos2(rect.left(), rect.bottom());
+            let d = egui::pos2(rect.right(), rect.top());
+            painter.line_segment([o, d], stroke);
+            painter.add(egui::Shape::convex_polygon(
+                vec![d, egui::pos2(d.x - w * 0.3, d.y + h * 0.12), egui::pos2(d.x - w * 0.12, d.y + h * 0.3)],
+                color,
+                egui::Stroke::NONE,
+            ));
+        }
+        // Dos rampas cruzadas: la de A bajando y la de B subiendo.
+        IconKind::Cruce => {
+            painter.line_segment([egui::pos2(rect.left(), rect.top()), egui::pos2(rect.right(), rect.bottom())], stroke);
+            painter.line_segment([egui::pos2(rect.left(), rect.bottom()), egui::pos2(rect.right(), rect.top())], stroke);
+        }
+        // Una rampa que baja, con punta de flecha. Es la forma del fade out.
+        IconKind::Salida => {
+            let o = egui::pos2(rect.left(), rect.top());
+            let d = egui::pos2(rect.right(), rect.bottom());
+            painter.line_segment([o, d], stroke);
+            painter.add(egui::Shape::convex_polygon(
+                vec![d, egui::pos2(d.x - w * 0.3, d.y - h * 0.12), egui::pos2(d.x - w * 0.12, d.y - h * 0.3)],
+                color,
+                egui::Stroke::NONE,
+            ));
+        }
+        IconKind::Siguiente => {
+            painter.line_segment([egui::pos2(rect.right(), rect.center().y), egui::pos2(rect.left() + w * 0.45, rect.center().y), ], stroke);
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    egui::pos2(rect.right(), rect.center().y),
+                    egui::pos2(rect.right() - w * 0.28, rect.center().y - h * 0.22),
+                    egui::pos2(rect.right() - w * 0.28, rect.center().y + h * 0.22),
+                ],
+                color,
+                egui::Stroke::NONE,
+            ));
+            painter.line_segment([egui::pos2(rect.left(), rect.top() + h * 0.25), egui::pos2(rect.left(), rect.bottom() - h * 0.25)], stroke);
+        }
+        IconKind::Loop => {
+            painter.circle_stroke(rect.center(), w * 0.34, stroke);
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    egui::pos2(rect.center().x + w * 0.34, rect.center().y - h * 0.05),
+                    egui::pos2(rect.center().x + w * 0.22, rect.center().y - h * 0.28),
+                    egui::pos2(rect.center().x + w * 0.46, rect.center().y - h * 0.22),
+                ],
+                color,
+                egui::Stroke::NONE,
+            ));
+        }
+        IconKind::Volumen => {
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    egui::pos2(rect.left(), rect.center().y - h * 0.18),
+                    egui::pos2(rect.left() + w * 0.25, rect.center().y - h * 0.18),
+                    egui::pos2(rect.left() + w * 0.52, rect.center().y - h * 0.34),
+                    egui::pos2(rect.left() + w * 0.52, rect.center().y + h * 0.34),
+                    egui::pos2(rect.left() + w * 0.25, rect.center().y + h * 0.18),
+                    egui::pos2(rect.left(), rect.center().y + h * 0.18),
+                ],
+                color,
+                egui::Stroke::NONE,
+            ));
+            painter.circle_stroke(egui::pos2(rect.left() + w * 0.62, rect.center().y), w * 0.1, stroke);
+            painter.line_segment([egui::pos2(rect.right(), rect.center().y - h * 0.22), egui::pos2(rect.right(), rect.center().y + h * 0.22)], stroke);
+        }
+        IconKind::Espera => {
+            painter.circle_stroke(rect.center(), w * 0.36, stroke);
+            painter.line_segment([rect.center(), egui::pos2(rect.center().x, rect.center().y - h * 0.22), ], stroke);
+            painter.line_segment([rect.center(), egui::pos2(rect.center().x + w * 0.2, rect.center().y), ], stroke);
+        }
         IconKind::Probar => {
             // triángulo de play, relleno
             let pad = w * 0.2;
@@ -928,6 +1468,69 @@ fn dibujar_icono(painter: &egui::Painter, rect: egui::Rect, kind: IconKind, colo
             ];
             painter.add(egui::Shape::convex_polygon(
                 pts.to_vec(),
+                fill,
+                egui::Stroke::NONE,
+            ));
+        }
+        // Rayo: un efecto que entra de golpe y se acaba.
+        IconKind::Rayo => {
+            let pts = [
+                egui::pos2(c.x + w * 0.16, tl.y + 1.0),
+                egui::pos2(c.x - w * 0.22, c.y),
+                egui::pos2(c.x - w * 0.01, c.y),
+                egui::pos2(c.x - w * 0.16, br.y - 1.0),
+                egui::pos2(c.x + w * 0.26, c.y - h * 0.04),
+                egui::pos2(c.x + w * 0.03, c.y - h * 0.04),
+            ];
+            painter.add(egui::Shape::convex_polygon(
+                pts.to_vec(),
+                fill,
+                egui::Stroke::NONE,
+            ));
+        }
+        // Más y menos: el mismo brazo, con o sin la barra horizontal.
+        IconKind::Mas | IconKind::Menos => {
+            let arm = w * 0.32;
+            painter.line_segment(
+                [egui::pos2(c.x - arm, c.y), egui::pos2(c.x + arm, c.y)],
+                stroke,
+            );
+            if matches!(kind, IconKind::Mas) {
+                painter.line_segment(
+                    [egui::pos2(c.x, c.y - arm), egui::pos2(c.x, c.y + arm)],
+                    stroke,
+                );
+            }
+        }
+        // Tres teclas en fila: cómo se dispara esto a mano.
+        IconKind::Teclado => {
+            let ancho_tecla = w * 0.26;
+            let alto_tecla = h * 0.44;
+            for i in 0..3 {
+                let x = tl.x + w * 0.11 + i as f32 * (ancho_tecla + w * 0.06);
+                let tecla = egui::Rect::from_min_size(
+                    egui::pos2(x, c.y - alto_tecla / 2.0),
+                    egui::vec2(ancho_tecla, alto_tecla),
+                );
+                painter.rect_stroke(
+                    tecla,
+                    egui::CornerRadius::same(2),
+                    stroke,
+                    egui::epaint::StrokeKind::Inside,
+                );
+            }
+        }
+        // Lápiz: este evento se puede retocar sin rehacerlo.
+        IconKind::Editar => {
+            let punta = egui::pos2(tl.x + w * 0.18, br.y - h * 0.18);
+            let cabo = egui::pos2(br.x - w * 0.18, tl.y + h * 0.18);
+            painter.line_segment([punta, cabo], stroke);
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    punta,
+                    egui::pos2(punta.x - w * 0.14, punta.y - h * 0.06),
+                    egui::pos2(punta.x + w * 0.06, punta.y - h * 0.14),
+                ],
                 fill,
                 egui::Stroke::NONE,
             ));
@@ -1015,6 +1618,66 @@ fn boton_icono_chico(
     let icon_rect = rect.shrink(4.0);
     dibujar_icono(ui.painter(), icon_rect, icono, paint_color);
 
+
+    response
+}
+
+/// Pestaña con icono grande arriba y etiqueta debajo.
+///
+/// Es más compacta que `boton_icono` con texto al lado, así caben todas en una
+/// franja estrecha. La pestaña activa se distingue por el fondo coloreado y un
+/// borde verde (el mismo verde del GO).
+///
+/// `ancho` se puede dar más holgado cuando sólo hay dos pestañas y la etiqueta
+/// es larga: las del panel central ("Audios" / "Eventos") lo necesitan.
+fn pestana_icono(
+    ui: &mut egui::Ui,
+    icono: IconKind,
+    rotulo: &str,
+    activa: bool,
+    ancho: f32,
+) -> egui::Response {
+    let w = ancho;
+    let h = 64.0_f32;
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::click());
+
+    let bg = if activa {
+        // La activa lleva el fondo del cue activo: se identifica sin tener
+        // que leer la etiqueta.
+        BG_ROW_ACTIVE
+    } else if response.is_pointer_button_down_on() {
+        BG_ROW_ACTIVE
+    } else if response.hovered() {
+        BG_ROW_ALT
+    } else {
+        BG_PANEL
+    };
+    ui.painter().rect_filled(rect, egui::CornerRadius::same(6), bg);
+    if activa {
+        ui.painter().rect_stroke(
+            rect,
+            egui::CornerRadius::same(6),
+            egui::Stroke { width: 1.5, color: GO_GREEN },
+            egui::epaint::StrokeKind::Inside,
+        );
+    }
+
+    let icon_color = if activa { GO_GREEN } else { FG_BASE };
+    let icon_size = 24.0_f32;
+    let icon_rect = egui::Rect::from_center_size(
+        egui::pos2(rect.center().x, rect.top() + 8.0 + icon_size / 2.0),
+        egui::vec2(icon_size, icon_size),
+    );
+    dibujar_icono(ui.painter(), icon_rect, icono, icon_color);
+
+    let text_color = if activa { FG_STRONG } else { FG_BASE };
+    ui.painter().text(
+        egui::pos2(rect.center().x, rect.bottom() - 8.0),
+        egui::Align2::CENTER_BOTTOM,
+        rotulo,
+        egui::FontId::proportional(13.0),
+        text_color,
+    );
 
     response
 }
@@ -1185,6 +1848,14 @@ impl eframe::App for App {
     /// `logic` también con la ventana oculta, y porque desde aquí se puede
     /// pedir un repintado sin dibujar nada.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.frames = self.frames.saturating_add(1);
+        // Se anota en qué frame empezó la pulsación. En el frame 1 puede venir
+        // una que se inició antes de que existiera esta ventana (la que abrió
+        // el programa, o el foco que da el sistema): esa no es del operador y
+        // no debe accionar nada.
+        if ctx.input(|i| i.pointer.any_pressed()) {
+            self.frame_pulsacion = Some(self.frames);
+        }
         if !self.iniciado {
             self.iniciar();
         }
@@ -1255,16 +1926,26 @@ impl eframe::App for App {
             });
             if let Some(n) = pulsada {
                 let nombre = format!("F{}", n + 1);
+                // Primero se mira si esa F está asignada a algo (un audio o un
+                // evento); si no, la F dispara el audio de esa posición (F1 = el
+                // primero), que es lo que hará cualquiera sin configurar nada.
                 let asignada = self
                     .entradas
                     .iter()
-                    .position(|e| e.tecla.as_deref() == Some(nombre.as_str()));
-                // Si esa F está asignada a una entrada, se usa; si no, la F
-                // dispara la entrada de esa posición (F1 = la primera), que es lo
-                // que pide el plan y lo que hará cualquiera sin configurar nada.
-                let destino = asignada.or(Some(n)).filter(|i| *i < self.entradas.len());
-                if let Some(i) = destino {
-                    self.ir(i);
+                    .position(|e| e.tecla.as_deref() == Some(nombre.as_str()))
+                    .map(Objeto::Audio)
+                    .or_else(|| {
+                        self.eventos
+                            .iter()
+                            .position(|v| v.evento.tecla.as_deref() == Some(nombre.as_str()))
+                            .map(Objeto::Evento)
+                    });
+
+                let destino = asignada.or(Some(Objeto::Audio(n)));
+                match destino {
+                    Some(Objeto::Audio(i)) if i < self.entradas.len() => self.ir(i),
+                    Some(Objeto::Evento(i)) => self.ir_evento(i),
+                    _ => {}
                 }
             }
 
@@ -1332,7 +2013,7 @@ impl eframe::App for App {
 
         if self.bloqueo.permite_editar() {
             egui::Panel::right("inspector")
-                .exact_size(360.0)
+                .exact_size(420.0)
                 .show(ui, |ui| self.inspector(ui));
         }
 
@@ -1361,11 +2042,19 @@ impl eframe::App for App {
         if self.ver_diagnostico {
             self.ventana_diagnostico(ui);
         }
+        // El asistente va al final: es una ventana encima de todo lo demás.
+        if self.asistente.is_some() {
+            self.ventana_asistente(ui);
+        }
     }
 }
 
 impl App {
     fn barra_superior(&mut self, ui: &mut egui::Ui) {
+        // Con la guarda de siempre: si el programa se acaba de abrir y la
+        // pulsación venía en vuelo, no se acciona ningún botón de aquí. Daño
+        // posible si no: "Nueva" tira la obra sin preguntar.
+        let clic_del_operador = self.clic_fiable();
         ui.horizontal_centered(|ui| {
             ui.label(
                 egui::RichText::new(format!("TeatroPlayer {}", env!("CARGO_PKG_VERSION")))
@@ -1388,23 +2077,29 @@ impl App {
             }
             ui.add_space(18.0);
 
-            if boton_icono(ui, IconKind::Nueva, "Nueva", None).clicked() {
+            if boton_icono(ui, IconKind::Nueva, "Nueva", None).clicked() && clic_del_operador {
                 self.obra_nueva();
             }
-            if boton_icono(ui, IconKind::Abrir, "Abrir…", None).clicked() {
+            if boton_icono(ui, IconKind::Abrir, "Abrir…", None).clicked() && clic_del_operador {
                 self.abrir();
             }
-            if boton_icono(ui, IconKind::Guardar, "Guardar", None).clicked() {
+            if boton_icono(ui, IconKind::Guardar, "Guardar", None).clicked() && clic_del_operador {
                 self.guardar();
             }
-            if boton_icono(ui, IconKind::Guardar, "Guardar como…", None).clicked() {
+            if boton_icono(ui, IconKind::Guardar, "Guardar como…", None).clicked()
+                && clic_del_operador
+            {
                 self.guardar_como();
             }
             ui.separator();
-            if boton_icono(ui, IconKind::AnadirAudio, "Añadir audio…", None).clicked() {
+            if boton_icono(ui, IconKind::AnadirAudio, "Añadir audio…", None).clicked()
+                && clic_del_operador
+            {
                 self.anadir_audio();
             }
-            if boton_icono(ui, IconKind::Abrir, "Abrir carpeta…", None).clicked() {
+            if boton_icono(ui, IconKind::Abrir, "Abrir carpeta…", None).clicked()
+                && clic_del_operador
+            {
                 self.abrir_carpeta();
             }
 
@@ -1437,13 +2132,17 @@ impl App {
     }
 
     fn transporte(&mut self, ui: &mut egui::Ui) {
+        // PARAR TODO y Probar sonaron por un clic en vuelo es exactamente lo
+        // que no puede pasar: el primero corta la función, el segundo mete un
+        // tono por la salida. Con la guarda de siempre.
+        let clic_del_operador = self.clic_fiable();
         ui.horizontal_centered(|ui| {
             let parar = egui::Button::new(
                 egui::RichText::new("PARAR TODO").color(FG_STRONG).strong(),
             )
             .fill(STOP_RED)
             .min_size(egui::vec2(150.0, 38.0));
-            if ui.add(parar).clicked() {
+            if ui.add(parar).clicked() && clic_del_operador {
                 self.parar_todo();
             }
 
@@ -1462,7 +2161,7 @@ impl App {
                         ui.selectable_value(&mut self.elegida, i, &s.name);
                     }
                 });
-            if boton_icono(ui, IconKind::Probar, "Probar", None).clicked() {
+            if boton_icono(ui, IconKind::Probar, "Probar", None).clicked() && clic_del_operador {
                 self.probar_salida();
             }
 
@@ -1508,7 +2207,51 @@ impl App {
 
     // --- lista de entradas -------------------------------------------------
 
+    /// Panel central: la franja de pestañas y la lista que toque.
     fn lista(&mut self, ui: &mut egui::Ui) {
+        let mut destino = self.lista;
+        let clic_del_operador = self.clic_fiable();
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(6.0, 0.0);
+            for t in [ListaTab::Audios, ListaTab::Eventos] {
+                let resp = pestana_icono(ui, t.icono(), t.rotulo(), self.lista == t, 96.0);
+                if resp.clicked() && clic_del_operador {
+                    destino = t;
+                }
+            }
+
+            ui.add_space(12.0);
+            if self.lista == ListaTab::Eventos {
+                if self.bloqueo.permite_editar()
+                    && boton_icono(ui, IconKind::Nueva, "Nuevo evento…", None).clicked()
+                    && clic_del_operador
+                {
+                    self.abrir_asistente();
+                }
+                ui.label(
+                    egui::RichText::new(format!("{} eventos", self.eventos.len()))
+                        .color(FG_MUTE),
+                );
+            } else {
+                ui.label(
+                    egui::RichText::new(format!("{} audios", self.entradas.len())).color(FG_MUTE),
+                );
+            }
+        });
+        self.lista = destino;
+
+        ui.separator();
+
+        match self.lista {
+            ListaTab::Audios => self.lista_audios(ui),
+            ListaTab::Eventos => self.lista_eventos(ui),
+        }
+    }
+
+    fn lista_audios(&mut self, ui: &mut egui::Ui) {
+        // Un clic que venía en vuelo al abrirse la ventana no debe sonar ni
+        // borrar nada: ver `clic_fiable`.
+        let clic_del_operador = self.clic_fiable();
         if self.entradas.is_empty() {
             ui.vertical_centered(|ui| {
                 ui.add_space(80.0);
@@ -1639,7 +2382,7 @@ impl App {
                                             64.0,
                                             if self.bloqueo.en_funcion() { 46.0 } else { 28.0 },
                                         ));
-                                        if ui.add(go).clicked() {
+                                        if ui.add(go).clicked() && clic_del_operador {
                                             ir_a = Some(i);
                                         }
                                     }
@@ -1696,7 +2439,9 @@ impl App {
                                         if boton_icono_chico(ui, IconKind::Bajar, None).clicked() {
                                             self.mover(i, 1);
                                         }
-                                        if boton_icono_chico(ui, IconKind::Quitar, Some(STOP_RED)).clicked() {
+                                        if boton_icono_chico(ui, IconKind::Quitar, Some(STOP_RED)).clicked()
+                                            && clic_del_operador
+                                        {
                                             self.quitar(i);
                                         }
                                     }
@@ -1718,15 +2463,496 @@ impl App {
         }
     }
 
+    /// Lista de eventos predefinidos.
+    ///
+    /// Los botones − y + de la duración funcionan **también en modo Función**:
+    /// son la manera de acortar o alargar una escena sobre la marcha, que es
+    /// justo lo que antes obligaba a rehacer la configuración. Mueven un
+    /// número; los audios, la curva y el bucle se quedan como estaban.
+    fn lista_eventos(&mut self, ui: &mut egui::Ui) {
+        // Un clic que venía en vuelo al abrirse la ventana no debe sonar ni
+        // borrar nada: ver `clic_fiable`.
+        let clic_del_operador = self.clic_fiable();
+        if self.eventos.is_empty() {
+            ui.vertical_centered(|ui| {
+                ui.add_space(70.0);
+                ui.label(
+                    egui::RichText::new("Todavía no hay eventos")
+                        .color(FG_STRONG)
+                        .size(20.0),
+                );
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new(
+                        "Un evento es una escena montada: un audio que sube, que baja,\
+                         dos que se cruzan, o un efecto de golpe.",
+                    )
+                    .color(FG_MUTE),
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Se monta con los {} audios de la otra lista y se guarda con la obra.",
+                        self.entradas.len()
+                    ))
+                    .color(FG_MUTE),
+                );
+                ui.add_space(16.0);
+                if self.bloqueo.permite_editar()
+                    && boton_icono(ui, IconKind::Nueva, "Crear un evento…", None).clicked()
+                    && clic_del_operador
+                {
+                    self.abrir_asistente();
+                }
+            });
+            return;
+        }
+
+        let mut seleccionar: Option<usize> = None;
+        let mut lanzar: Option<usize> = None;
+        let mut ajustar: Option<(usize, i64)> = None;
+        let mut quitar: Option<usize> = None;
+        let mut mover: Option<(usize, isize)> = None;
+
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for i in 0..self.eventos.len() {
+                let v = &self.eventos[i];
+                let nombre = v.evento.nombre.clone();
+                let resumen = v.evento.resumen();
+                let tipo = v.evento.tipo;
+                let duracion = v.evento.duracion();
+                let sonando = v.sonando();
+                let falta = v.falta;
+                let incompleto = !v.evento.completo();
+                let tecla = v.evento.tecla.clone();
+                let seleccionada = self.evento_sel == Some(i);
+                let color = EVENT_COLORS[i % EVENT_COLORS.len()];
+                let en_funcion = self.bloqueo.en_funcion();
+
+                let fondo = if falta || incompleto {
+                    egui::Color32::from_rgb(0x3A, 0x22, 0x26)
+                } else if sonando || seleccionada {
+                    BG_ROW_ACTIVE
+                } else if i % 2 == 0 {
+                    BG_ROW
+                } else {
+                    BG_ROW_ALT
+                };
+
+                let fila = egui::Frame::new()
+                    .fill(fondo)
+                    .inner_margin(egui::Margin::symmetric(8, 6))
+                    .show(ui, |ui| {
+                        ui.set_min_height(if en_funcion { 72.0 } else { 40.0 });
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("■").color(color).size(18.0));
+                            ui.label(
+                                egui::RichText::new(format!("{}", i + 1))
+                                    .color(FG_MUTE)
+                                    .monospace(),
+                            );
+                            if let Some(t) = &tecla {
+                                ui.label(
+                                    egui::RichText::new(t).color(FG_MUTE).monospace().size(11.0),
+                                );
+                            }
+
+                            // Icono del tipo: es lo que distingue una fila de
+                            // otra de un vistazo.
+                            let icono_rect =
+                                ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
+                            dibujar_icono(
+                                ui.painter(),
+                                icono_rect.0,
+                                icono_de_tipo(tipo),
+                                color,
+                            );
+
+                            let titulo = egui::RichText::new(&nombre)
+                                .color(if falta || incompleto {
+                                    STOP_RED
+                                } else if sonando {
+                                    GO_GREEN
+                                } else {
+                                    FG_STRONG
+                                })
+                                .size(if en_funcion { 18.0 } else { 14.0 });
+                            if ui.selectable_label(seleccionada, titulo).clicked() {
+                                seleccionar = Some(i);
+                            }
+                            ui.label(egui::RichText::new(&resumen).color(FG_BASE).size(11.0));
+
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    // Acortar / alargar la escena. Disponible
+                                    // siempre: es el ajuste de una función.
+                                    if boton_icono_chico(ui, IconKind::Mas, None).clicked()
+                                        && clic_del_operador
+                                    {
+                                        ajustar = Some((i, paso_de_duracion(duracion) as i64));
+                                    }
+                                    ui.label(
+                                        egui::RichText::new(formatear(duracion))
+                                            .color(FG_STRONG)
+                                            .monospace()
+                                            .size(if en_funcion { 15.0 } else { 13.0 }),
+                                    );
+                                    if boton_icono_chico(ui, IconKind::Menos, None).clicked()
+                                        && clic_del_operador
+                                    {
+                                        ajustar = Some((i, -(paso_de_duracion(duracion) as i64)));
+                                    }
+
+                                    if falta || incompleto {
+                                        ui.add_enabled(
+                                            false,
+                                            egui::Button::new("FALTA").min_size(egui::vec2(70.0, 28.0)),
+                                        );
+                                    } else {
+                                        let lanzar_btn = egui::Button::new(
+                                            egui::RichText::new(if tipo.usa_fade() {
+                                                "LANZAR"
+                                            } else {
+                                                "GOLPE"
+                                            })
+                                            .color(egui::Color32::BLACK)
+                                            .strong(),
+                                        )
+                                        .fill(if tipo.usa_fade() { GO_GREEN } else { WARN_AMBER })
+                                        .min_size(egui::vec2(
+                                            78.0,
+                                            if en_funcion { 46.0 } else { 28.0 },
+                                        ));
+                                        if ui.add(lanzar_btn).clicked() && clic_del_operador {
+                                            lanzar = Some(i);
+                                        }
+                                    }
+
+                                    if sonando {
+                                        ui.label(
+                                            egui::RichText::new("sonando")
+                                                .color(GO_GREEN)
+                                                .size(11.0),
+                                        );
+                                    }
+
+                                    if self.bloqueo.permite_editar() {
+                                        if boton_icono_chico(ui, IconKind::Subir, None).clicked() {
+                                            mover = Some((i, -1));
+                                        }
+                                        if boton_icono_chico(ui, IconKind::Bajar, None).clicked() {
+                                            mover = Some((i, 1));
+                                        }
+                                        if boton_icono_chico(ui, IconKind::Quitar, Some(STOP_RED))
+                                            .clicked()
+                                            && clic_del_operador
+                                        {
+                                            quitar = Some(i);
+                                        }
+                                    }
+                                },
+                            );
+                        });
+                    });
+                let _ = fila;
+            }
+        });
+
+        if let Some(i) = seleccionar {
+            self.evento_sel = Some(i);
+        }
+        if let Some(i) = lanzar {
+            self.ir_evento(i);
+        }
+        if let Some((i, delta)) = ajustar {
+            self.ajustar_duracion_evento(i, delta);
+        }
+        if let Some(i) = quitar {
+            self.quitar_evento(i);
+        }
+        if let Some((i, delta)) = mover {
+            self.mover_evento(i, delta);
+        }
+    }
+
     // --- inspector ---------------------------------------------------------
 
+    /// El panel de la derecha.
+    ///
+    /// Es **una sola columna con scroll**, sin pestañas. Antes había cinco
+    /// pestañas con icono y había que adivinar en cuál vivía el control que se
+    /// buscaba; ahora todo está a la vista en secciones con su rótulo, que es
+    /// lo que hace falta cuando se está ajustando una escena.
     fn inspector(&mut self, ui: &mut egui::Ui) {
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            match self.lista {
+                ListaTab::Audios => self.inspector_audio(ui),
+                ListaTab::Eventos => self.inspector_evento(ui),
+            }
+        });
+    }
+
+    /// Ventana paso a paso para crear un evento: **primero el tipo, luego los
+    /// audios**.
+    ///
+    /// Es el orden que tiene sentido: el tipo decide cuántos audios hacen falta
+    /// y qué rampa le toca a cada uno, así que preguntarlo antes evita elegir
+    /// dos audios para un evento que sólo necesita uno.
+    fn ventana_asistente(&mut self, ui: &mut egui::Ui) {
+        let Some(asistente) = self.asistente.as_mut() else { return };
+        let mut cerrar = false;
+        let mut crear = false;
+        let mut atras = false;
+        let mut adelante = false;
+
+        let tipo = asistente.tipo;
+        let paso = asistente.paso;
+
+        egui::Window::new("Nuevo evento")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ui.ctx(), |ui| {
+                ui.set_min_width(430.0);
+                ui.label(
+                    egui::RichText::new(format!("Paso {} de 2", paso + 1))
+                        .color(FG_MUTE)
+                        .size(11.0),
+                );
+                ui.add_space(6.0);
+
+                if paso == 0 {
+                    ui.label(
+                        egui::RichText::new("1. ¿Qué tiene que pasar?")
+                            .color(FG_STRONG)
+                            .size(15.0),
+                    );
+                    ui.add_space(6.0);
+                    for t in TipoEvento::TODOS {
+                        ui.horizontal(|ui| {
+                            let icono_rect = ui.allocate_exact_size(
+                                egui::vec2(20.0, 20.0),
+                                egui::Sense::hover(),
+                            );
+                            dibujar_icono(ui.painter(), icono_rect.0, icono_de_tipo(t), FG_BASE);
+                            ui.radio_value(&mut asistente.tipo, t, t.rotulo());
+                        });
+                        ui.label(
+                            egui::RichText::new(t.descripcion()).color(FG_MUTE).size(11.0),
+                        );
+                        ui.add_space(6.0);
+                    }
+                    if self.entradas.is_empty() {
+                        ui.label(
+                            egui::RichText::new(
+                                "AVISO: todavía no hay audios en la obra. Se puede crear el \
+                                 evento igual y elegirlos después.",
+                            )
+                            .color(WARN_AMBER)
+                            .size(11.0),
+                        );
+                    }
+                } else {
+                    ui.label(
+                        egui::RichText::new(format!("2. ¿Qué audio entra? ({})", tipo.rotulo()))
+                            .color(FG_STRONG)
+                            .size(15.0),
+                    );
+                    ui.add_space(6.0);
+
+                    if tipo.cuantos_audios() == 0 {
+                        // El fade out no pide audio: actúa sobre el que suene.
+                        ui.label(
+                            egui::RichText::new(
+                                "Este evento no necesita ningún audio: baja el que esté \
+                                 sonando en el momento en que lo lances.",
+                            )
+                            .color(FG_BASE),
+                        );
+                        ui.add_space(6.0);
+                        ui.label(
+                            egui::RichText::new(
+                                "La duración y hasta qué volumen baja se ajustan luego, en el \
+                                 panel de la derecha.",
+                            )
+                            .color(FG_MUTE)
+                            .size(11.0),
+                        );
+                    } else {
+                        if tipo == TipoEvento::Crossfade {
+                            ui.label(
+                                egui::RichText::new(
+                                    "El que se va no se elige: es el que esté sonando cuando \
+                                     lances el evento.",
+                                )
+                                .color(FG_MUTE)
+                                .size(11.0),
+                            );
+                            ui.add_space(6.0);
+                        }
+
+                        let nombres: Vec<String> =
+                            self.entradas.iter().map(|e| e.nombre.clone()).collect();
+                        let elegido = asistente.elegidos.first().copied().flatten();
+                        let mut elegido_mut = elegido;
+                        egui::ComboBox::from_id_salt("asistente_audio")
+                            .width(280.0)
+                            .selected_text(match elegido.and_then(|j| nombres.get(j)) {
+                                Some(n) => n.clone(),
+                                None => "— elige un audio —".to_string(),
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut elegido_mut, None, "— ninguno —");
+                                for (j, nombre) in nombres.iter().enumerate() {
+                                    ui.selectable_value(&mut elegido_mut, Some(j), nombre.clone());
+                                }
+                            });
+                        if let Some(slot) = asistente.elegidos.first_mut() {
+                            *slot = elegido_mut;
+                        }
+
+                        ui.add_space(6.0);
+                        ui.label(
+                            egui::RichText::new(
+                                "También se puede dejar para después: el evento se crea igual y \
+                                 se elige el audio desde el panel de la derecha.",
+                            )
+                            .color(FG_MUTE)
+                            .size(11.0),
+                        );
+                    }
+                }
+
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if paso == 0 {
+                        if ui.button("Cancelar").clicked() {
+                            cerrar = true;
+                        }
+                        if ui
+                            .add(
+                                egui::Button::new("Siguiente →")
+                                    .fill(BG_ROW_ACTIVE)
+                                    .min_size(egui::vec2(110.0, 28.0)),
+                            )
+                            .clicked()
+                        {
+                            adelante = true;
+                        }
+                    } else {
+                        if ui.button("← Atrás").clicked() {
+                            atras = true;
+                        }
+                        if ui.button("Cancelar").clicked() {
+                            cerrar = true;
+                        }
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new("Crear evento")
+                                        .color(egui::Color32::BLACK)
+                                        .strong(),
+                                )
+                                .fill(GO_GREEN)
+                                .min_size(egui::vec2(120.0, 28.0)),
+                            )
+                            .clicked()
+                        {
+                            crear = true;
+                        }
+                    }
+                });
+            });
+
+        if cerrar {
+            self.asistente = None;
+            self.anotar("asistente cancelado");
+            return;
+        }
+        if atras {
+            if let Some(a) = self.asistente.as_mut() {
+                a.paso = 0;
+            }
+            return;
+        }
+        if adelante {
+            if let Some(a) = self.asistente.as_mut() {
+                // El tipo pudo cambiar en el paso 1: los huecos se ajustan al
+                // pasar al paso 2, que es cuando se preguntan los audios.
+                let cuantos = a.tipo.cuantos_audios();
+                a.elegidos.resize(cuantos, None);
+                a.paso = 1;
+            }
+            return;
+        }
+        if crear {
+            self.crear_evento_del_asistente();
+        }
+    }
+
+    /// Crea el evento con lo que se eligió en el asistente.
+    fn crear_evento_del_asistente(&mut self) {
+        let Some(a) = self.asistente.take() else { return };
+
+        self.historial.registrar(&self.instantanea());
+
+        let mut evento = Evento::nuevo(a.tipo);
+        let cuantos = a.tipo.cuantos_audios();
+        Self::reajustar_huecos(&mut evento);
+
+        for slot in 0..cuantos {
+            if let Some(j) = a.elegidos.get(slot).copied().flatten() {
+                if let Some(entrada) = self.entradas.get(j) {
+                    evento.pistas[slot].nombre = entrada.nombre.clone();
+                    evento.pistas[slot].audio = entrada.audio.clone();
+                }
+            }
+        }
+
+        // Nombre con el tipo y un número: "Fade in 2". Se puede cambiar luego.
+        let repetidos = self.eventos.iter().filter(|v| v.evento.tipo == a.tipo).count();
+        evento.nombre = if repetidos == 0 {
+            a.tipo.rotulo().to_string()
+        } else {
+            format!("{} {}", a.tipo.rotulo(), repetidos + 1)
+        };
+
+        let resumen = evento.resumen();
+        self.eventos.push(EventoVivo::nuevo(evento.clone()));
+        self.evento_sel = Some(self.eventos.len() - 1);
+        self.lista = ListaTab::Eventos;
+        self.refrescar_falta_eventos();
+        self.sucio = true;
+        self.auto.pedir();
+        self.anotar(format!("evento creado: {} ({resumen})", evento.nombre));
+    }
+
+    /// Rótulo de sección: icono, título y una raya.
+    ///
+    /// El icono no es adorno: es lo que hace que se encuentre la sección de un
+    /// vistazo al bajar por el panel, igual que en la lista de audios.
+    fn seccion(ui: &mut egui::Ui, icono: IconKind, titulo: &str) {
+        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            let rect = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+            dibujar_icono(ui.painter(), rect.0, icono, FG_BASE);
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new(titulo).color(FG_STRONG).size(14.0).strong());
+        });
+        ui.add_space(2.0);
+        ui.separator();
+        ui.add_space(4.0);
+    }
+
+    /// Editor de un audio: nombre, transición, cruce, salida, repetición,
+    /// volumen y los ajustes de la entrada (tecla y pad).
+    fn inspector_audio(&mut self, ui: &mut egui::Ui) {
         let Some(i) = self.seleccionada else {
             ui.vertical_centered(|ui| {
                 ui.add_space(40.0);
                 ui.label(
-                    egui::RichText::new("Selecciona una entrada\npara editarla")
-                        .color(FG_MUTE),
+                    egui::RichText::new("Selecciona un audio\npara editarlo").color(FG_MUTE),
                 );
             });
             return;
@@ -1736,75 +2962,370 @@ impl App {
             return;
         }
 
-        let nombre = self.entradas[i].nombre.clone();
-        ui.label(egui::RichText::new(&nombre).color(FG_STRONG).size(17.0).strong());
-
-        // Pad y tecla no son del sonido sino de la entrada: van aquí arriba,
-        // siempre visibles, no dentro de una pestaña (T-UI-007, T-UI-009).
-        {
-            let mut pad = self.entradas[i].pad;
-            if ui.checkbox(&mut pad, "Aparece en la franja de pads").changed() {
-                self.historial.registrar(&self.instantanea());
-                self.entradas[i].pad = pad;
-                self.sucio = true;
-                self.auto.pedir();
-            }
-        }
-
-        {
-            let mut tecla = self.entradas[i].tecla.clone();
-            let antes = tecla.clone();
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("Tecla:").color(FG_MUTE));
-                egui::ComboBox::from_id_salt("tecla")
-                    .width(120.0)
-                    .selected_text(tecla.clone().unwrap_or_else(|| "ninguna".to_string()))
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut tecla, None, "ninguna");
-                        for n in 1..=12 {
-                            let t = format!("F{n}");
-                            ui.selectable_value(&mut tecla, Some(t.clone()), t);
-                        }
-                    });
-            });
-            if tecla != antes {
-                self.entradas[i].tecla = tecla;
-                self.sucio = true;
-                self.auto.pedir();
-            }
+        // --- nombre ------------------------------------------------------
+        let antes_nombre = self.entradas[i].nombre.clone();
+        let mut nombre = antes_nombre.clone();
+        ui.add(
+            egui::TextEdit::singleline(&mut nombre)
+                .font(egui::FontId::proportional(17.0))
+                .desired_width(f32::INFINITY),
+        );
+        if nombre != antes_nombre {
+            self.historial.registrar(&self.instantanea());
+            self.entradas[i].nombre = nombre;
+            self.sucio = true;
+            self.auto.pedir();
         }
         ui.label(
-            egui::RichText::new(self.entradas[i].fuente.resumen())
-                .color(FG_MUTE)
-                .size(11.0),
+            egui::RichText::new(self.entradas[i].fuente.resumen()).color(FG_MUTE).size(11.0),
         );
-        ui.separator();
 
-        ui.horizontal(|ui| {
-            for t in Tab::TODOS {
-                ui.selectable_value(&mut self.tab, t, t.rotulo());
-            }
-        });
-        ui.separator();
-
+        // --- el sonido ---------------------------------------------------
         // Se saca una copia del spec, se edita y se vuelve a guardar: evita
         // pelearse con el borrow checker dentro de los closures de egui.
         let mut spec = self.entradas[i].spec.clone();
         let mut auto = self.entradas[i].auto_follow;
         let antes = spec.clone();
         let auto_antes = auto;
-        match self.tab {
-            Tab::Entrada => ui_entrada(ui, &mut spec),
-            Tab::Anterior => ui_anterior(ui, &mut spec),
-            Tab::Salida => ui_salida(ui, &mut spec, &mut auto),
-            Tab::Repeticion => ui_repeticion(ui, &mut spec),
-            Tab::Volumen => ui_volumen(ui, &mut spec),
-        }
+
+        App::seccion(ui, IconKind::Entrada, "Cómo entra este audio");
+        ui_transicion(ui, &mut spec);
+
+        App::seccion(ui, IconKind::Cruce, "Qué pasa con lo que esté sonando");
+        ui_anterior(ui, &mut spec);
+
+        App::seccion(ui, IconKind::Salida, "Cómo sale");
+        ui_salida(ui, &mut spec, &mut auto);
+
+        App::seccion(ui, IconKind::Loop, "Repetición");
+        ui_repeticion(ui, &mut spec);
+
+        App::seccion(ui, IconKind::Volumen, "Volumen");
+        ui_volumen(ui, &mut spec);
+
         if spec != antes || auto != auto_antes {
             self.entradas[i].spec = spec;
             self.entradas[i].auto_follow = auto;
             self.sucio = true;
             self.auto.pedir();
+        }
+
+        App::seccion(ui, IconKind::Teclado, "Tecla y pads");
+        self.ui_tecla_y_pad(ui, Objeto::Audio(i));
+    }
+
+    /// Editor de un evento: tipo, audios con sus dos extremos, duración,
+    /// curva, bucle y ajustes del evento.
+    fn inspector_evento(&mut self, ui: &mut egui::Ui) {
+        let Some(i) = self.evento_sel else {
+            ui.vertical_centered(|ui| {
+                ui.add_space(40.0);
+                ui.label(
+                    egui::RichText::new("Selecciona un evento\npara editarlo").color(FG_MUTE),
+                );
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new(
+                        "Un evento es una escena montada con los audios de la otra lista.",
+                    )
+                    .color(FG_MUTE)
+                    .size(11.0),
+                );
+            });
+            return;
+        };
+        if self.eventos.get(i).is_none() {
+            self.evento_sel = None;
+            return;
+        }
+
+        let mut evento = self.eventos[i].evento.clone();
+        let antes = evento.clone();
+
+        // --- nombre ------------------------------------------------------
+        ui.add(
+            egui::TextEdit::singleline(&mut evento.nombre)
+                .font(egui::FontId::proportional(17.0))
+                .desired_width(f32::INFINITY),
+        );
+
+        if self.eventos[i].falta {
+            ui.label(
+                egui::RichText::new("Algún audio de este evento ya no está en la lista de audios")
+                    .color(STOP_RED)
+                    .size(11.0),
+            );
+        } else if !evento.completo() {
+            ui.label(
+                egui::RichText::new("Falta algún audio por elegir")
+                    .color(WARN_AMBER)
+                    .size(11.0),
+            );
+        }
+
+        // --- tipo --------------------------------------------------------
+        App::seccion(ui, IconKind::Editar, "Tipo de evento");
+        // Se puede cambiar el tipo sin perder lo ya configurado: los audios
+        // que caben se conservan y los huecos que sobren se van.
+        let tipo_antes = evento.tipo;
+        for t in TipoEvento::TODOS {
+            ui.radio_value(&mut evento.tipo, t, t.rotulo());
+        }
+        if evento.tipo != tipo_antes {
+            // Los huecos se reajustan al tipo nuevo, conservando los audios que
+            // ya estuvieran elegidos.
+            Self::reajustar_huecos(&mut evento);
+        }
+        ui.label(
+            egui::RichText::new(evento.tipo.descripcion()).color(FG_MUTE).size(11.0),
+        );
+
+        // --- duración ----------------------------------------------------
+        App::seccion(ui, IconKind::Espera, "Duración de la escena");
+        if evento.tipo.usa_fade() {
+            ui.label(
+                egui::RichText::new(
+                    "Éste es el número que se mueve para acortar o alargar la escena. \
+                     Los audios y el resto de la configuración se quedan como están.",
+                )
+                .color(FG_MUTE)
+                .size(11.0),
+            );
+            ui.add_space(4.0);
+            let mut duracion = evento.duracion();
+            ui.horizontal(|ui| {
+                slider_duracion(ui, &mut duracion, "Duración");
+            });
+            evento.duracion_ms = duracion.as_millis() as u64;
+
+            // Milisegundos exactos: para quien sabe que la escena son 7.500 ms.
+            let mut ms = evento.duracion_ms as i64;
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Exacto:").color(FG_MUTE));
+                ui.add(
+                    egui::DragValue::new(&mut ms)
+                        .range(100..=600_000)
+                        .speed(50.0)
+                        .suffix(" ms"),
+                );
+            });
+            evento.duracion_ms = ms.clamp(100, 600_000) as u64;
+
+            ui.horizontal(|ui| {
+                ui.label("Curva:");
+                combo_curva(ui, &mut evento.curva);
+            });
+            dibujar_rampa(
+                ui,
+                evento.pistas.first().map(|p| p.desde_pct).unwrap_or(0),
+                evento.pistas.first().map(|p| p.hasta_pct).unwrap_or(100),
+                evento.curva,
+            );
+        } else {
+            ui.label(
+                egui::RichText::new(
+                    "Un disparo único no tiene duración: suena de golpe y se acaba cuando \
+                     termina el audio.",
+                )
+                .color(FG_MUTE)
+                .size(11.0),
+            );
+        }
+
+        // --- audios ------------------------------------------------------
+        // --- lo que sale (sólo crossfade y fade out) ----------------------
+        if evento.tipo.actua_sobre_lo_que_suena() {
+            App::seccion(ui, IconKind::Salida, "Lo que está sonando");
+            ui.label(
+                egui::RichText::new(match evento.tipo {
+                    TipoEvento::Crossfade => {
+                        "El audio que se va no se elige: es el que está sonando cuando \
+                         lances el evento, y sale desde donde esté en ese momento."
+                    }
+                    _ => "Este evento no lleva audio: baja el que esté sonando en ese momento.",
+                })
+                .color(FG_MUTE)
+                .size(11.0),
+            );
+            ui.add_space(4.0);
+            slider_porcentaje(ui, "Baja hasta", &mut evento.salida_pct);
+            if evento.apaga_al_salir() {
+                ui.label(
+                    egui::RichText::new("Al llegar a 0 % la pista se apaga y se corta sola.")
+                        .color(FG_MUTE)
+                        .size(11.0),
+                );
+            } else {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Se queda sonando al {} %, no se corta.",
+                        evento.salida_pct
+                    ))
+                    .color(FG_MUTE)
+                    .size(11.0),
+                );
+            }
+            dibujar_rampa(ui, 100, evento.salida_pct, evento.curva);
+        }
+
+        // --- lo que entra (fade in, crossfade y disparo único) ------------
+        if evento.tipo.cuantos_audios() > 0 {
+            App::seccion(ui, IconKind::AnadirAudio, "Audio que entra");
+            let nombres: Vec<String> = self.entradas.iter().map(|e| e.nombre.clone()).collect();
+
+            let pista = &mut evento.pistas[0];
+            let elegido = self.entradas.iter().position(|e| {
+                !e.audio.file_name.is_empty() && e.audio.file_name == pista.audio.file_name
+            });
+            let mut elegido_mut = elegido;
+            egui::ComboBox::from_id_salt("audio_evento_entra")
+                .width(240.0)
+                .selected_text(if pista.vacio() {
+                    "— elige un audio —".to_string()
+                } else {
+                    pista.nombre.clone()
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut elegido_mut, None, "— ninguno —");
+                    for (j, nombre) in nombres.iter().enumerate() {
+                        ui.selectable_value(&mut elegido_mut, Some(j), nombre.clone());
+                    }
+                });
+            if elegido_mut != elegido {
+                match elegido_mut {
+                    Some(j) => {
+                        let entrada = &self.entradas[j];
+                        pista.nombre = entrada.nombre.clone();
+                        pista.audio = entrada.audio.clone();
+                    }
+                    None => {
+                        // Se quedan los porcentajes: quitar y volver a poner un
+                        // audio no debe borrar la rampa que ya estaba ajustada.
+                        pista.nombre.clear();
+                        pista.audio = AudioRef::default();
+                    }
+                }
+            }
+
+            if evento.tipo.usa_fade() {
+                slider_porcentaje(ui, "Desde", &mut pista.desde_pct);
+                slider_porcentaje(ui, "Hasta", &mut pista.hasta_pct);
+            }
+            ui_volumen_pista(ui, pista);
+            ui.add_space(6.0);
+        }
+
+        // --- bucle -------------------------------------------------------
+        App::seccion(ui, IconKind::Loop, "Repetición");
+        ui_repeticion_evento(ui, &mut evento);
+
+        if evento != antes {
+            self.historial.registrar(&self.instantanea());
+            self.eventos[i].evento = evento.clone();
+            // Si el tipo cambió, las pistas en curso ya no cuadran.
+            if self.eventos[i].pistas.len() != evento.pistas.len() {
+                self.eventos[i].parar();
+                self.eventos[i].pistas = (0..evento.pistas.len()).map(|_| None).collect();
+            }
+            self.refrescar_falta_eventos();
+            self.sucio = true;
+            self.auto.pedir();
+        }
+
+        App::seccion(ui, IconKind::Probar, "Lanzar");
+        ui.horizontal(|ui| {
+            if ui
+                .add(
+                    egui::Button::new(
+                        egui::RichText::new("LANZAR").color(egui::Color32::BLACK).strong(),
+                    )
+                    .fill(GO_GREEN)
+                    .min_size(egui::vec2(110.0, 34.0)),
+                )
+                .clicked()
+                && self.clic_fiable()
+            {
+                self.ir_evento(i);
+            }
+            ui.label(
+                egui::RichText::new(self.eventos[i].evento.resumen()).color(FG_MUTE).size(11.0),
+            );
+        });
+
+        App::seccion(ui, IconKind::Teclado, "Tecla y pads");
+        self.ui_tecla_y_pad(ui, Objeto::Evento(i));
+    }
+
+    /// Tecla F y franja de pads, para un audio o para un evento.
+    fn ui_tecla_y_pad(&mut self, ui: &mut egui::Ui, cual: Objeto) {
+        let mut tecla = match cual {
+            Objeto::Audio(i) => self.entradas[i].tecla.clone(),
+            Objeto::Evento(i) => self.eventos[i].evento.tecla.clone(),
+        };
+        let mut pad = match cual {
+            Objeto::Audio(i) => self.entradas[i].pad,
+            Objeto::Evento(i) => self.eventos[i].evento.pad,
+        };
+        let antes_tecla = tecla.clone();
+        let antes_pad = pad;
+
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Tecla:").color(FG_MUTE));
+            egui::ComboBox::from_id_salt(("tecla", cual.sal()))
+                .width(120.0)
+                .selected_text(tecla.clone().unwrap_or_else(|| "ninguna".to_string()))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut tecla, None, "ninguna");
+                    for n in 1..=12 {
+                        let t = format!("F{n}");
+                        ui.selectable_value(&mut tecla, Some(t.clone()), t);
+                    }
+                });
+        });
+        ui.checkbox(&mut pad, "Aparece en la franja de pads");
+
+        if tecla != antes_tecla || pad != antes_pad {
+            self.historial.registrar(&self.instantanea());
+            match cual {
+                Objeto::Audio(i) => {
+                    self.entradas[i].tecla = tecla;
+                    self.entradas[i].pad = pad;
+                }
+                Objeto::Evento(i) => {
+                    self.eventos[i].evento.tecla = tecla;
+                    self.eventos[i].evento.pad = pad;
+                }
+            }
+            self.sucio = true;
+            self.auto.pedir();
+        }
+    }
+
+    /// Ajusta el hueco de audio al tipo, conservando lo que ya estuviera
+    /// elegido.
+    ///
+    /// Es lo que permite pasar de un fade in a un crossfade sin rehacer nada:
+    /// los dos piden un audio —el que entra— y se queda donde estaba. Al pasar
+    /// a un fade out el hueco desaparece, porque ese evento actúa sobre lo que
+    /// ya suena.
+    fn reajustar_huecos(evento: &mut Evento) {
+        let cuantos = evento.tipo.cuantos_audios();
+        while evento.pistas.len() > cuantos {
+            evento.pistas.pop();
+        }
+        while evento.pistas.len() < cuantos {
+            let (desde, hasta) = evento.tipo.extremos_por_defecto();
+            evento.pistas.push(PistaEvento::vacia(desde, hasta));
+        }
+        // Los que siguen ahí conservan sus valores: sólo se recalculan los
+        // extremos si el audio sigue sin elegir, que es cuando no hay nada que
+        // perder.
+        for pista in evento.pistas.iter_mut() {
+            if pista.vacio() {
+                let (desde, hasta) = evento.tipo.extremos_por_defecto();
+                pista.desde_pct = desde;
+                pista.hasta_pct = hasta;
+            }
         }
     }
 
@@ -1813,31 +3334,58 @@ impl App {
     /// Un pad **no** apaga lo que está sonando por sí mismo: lo que pase con lo
     /// anterior lo decide el `onPrevious` de su entrada, igual que en la lista.
     fn franja_de_pads(&mut self, ui: &mut egui::Ui) {
+        // Un clic que venía en vuelo al abrirse la ventana no debe sonar ni
+        // borrar nada: ver `clic_fiable`.
+        let clic_del_operador = self.clic_fiable();
         ui.label(egui::RichText::new("Pads").color(FG_MUTE).size(11.0));
         ui.add_space(2.0);
 
         let lado = if self.bloqueo.en_funcion() { 140.0 } else { 96.0 };
-        let indices: Vec<usize> = self
+
+        // En la franja se mezclan audios y eventos: lo que el operador quiere
+        // es tener a mano lo que lanza a mano, sin importarle de cuál de las
+        // dos listas salga.
+        let mut pads: Vec<Objeto> = self
             .entradas
             .iter()
             .enumerate()
             .filter(|(_, e)| e.pad)
-            .map(|(i, _)| i)
+            .map(|(i, _)| Objeto::Audio(i))
             .collect();
+        pads.extend(
+            self.eventos
+                .iter()
+                .enumerate()
+                .filter(|(_, v)| v.evento.pad)
+                .map(|(i, _)| Objeto::Evento(i)),
+        );
 
-        let mut disparar: Option<usize> = None;
+        let mut disparar: Option<Objeto> = None;
         egui::ScrollArea::horizontal().show(ui, |ui| {
             ui.horizontal(|ui| {
-                for i in indices {
-                    let e = &self.entradas[i];
-                    let color = CUE_COLORS[e.color];
-                    let sonando = e.sonando();
+                for cual in pads {
+                    let (color, sonando, falta, numero, nombre) = match cual {
+                        Objeto::Audio(i) => {
+                            let e = &self.entradas[i];
+                            (CUE_COLORS[e.color], e.sonando(), e.falta, i + 1, e.nombre.clone())
+                        }
+                        Objeto::Evento(i) => {
+                            let v = &self.eventos[i];
+                            (
+                                EVENT_COLORS[i % EVENT_COLORS.len()],
+                                v.sonando(),
+                                v.falta || !v.evento.completo(),
+                                i + 1,
+                                v.evento.nombre.clone(),
+                            )
+                        }
+                    };
                     let relleno = if sonando {
                         color
                     } else {
                         egui::Color32::from_rgb(0x2C, 0x31, 0x3B)
                     };
-                    let texto = format!("{}\n{}", i + 1, e.nombre.clone());
+                    let texto = format!("{numero}\n{nombre}");
                     let boton = egui::Button::new(
                         egui::RichText::new(texto)
                             .color(if sonando { egui::Color32::BLACK } else { FG_STRONG })
@@ -1846,16 +3394,18 @@ impl App {
                     .fill(relleno)
                     .min_size(egui::vec2(lado, lado));
 
-                    if ui.add(boton).clicked() && !e.falta {
-                        disparar = Some(i);
+                    if ui.add(boton).clicked() && !falta && clic_del_operador {
+                        disparar = Some(cual);
                     }
                     ui.add_space(6.0);
                 }
             });
         });
 
-        if let Some(i) = disparar {
-            self.ir(i);
+        match disparar {
+            Some(Objeto::Audio(i)) => self.ir(i),
+            Some(Objeto::Evento(i)) => self.ir_evento(i),
+            None => {}
         }
     }
 
@@ -1893,11 +3443,21 @@ impl App {
                     .and_then(|u| self.entradas.get(u + 1))
                     .map(|e| e.nombre.clone());
                 if let Some(s) = siguiente {
-                    ui.label(
-                        egui::RichText::new(format!("después: {s}"))
-                            .color(FG_MUTE)
-                            .size(12.0),
-                    );
+                    ui.horizontal(|ui| {
+                        let icono_rect =
+                            ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+                        dibujar_icono(
+                            ui.painter(),
+                            icono_rect.0,
+                            IconKind::Siguiente,
+                            FG_BASE,
+                        );
+                        ui.label(
+                            egui::RichText::new(format!("después: {s}"))
+                                .color(FG_MUTE)
+                                .size(12.0),
+                        );
+                    });
                 }
             });
         });
@@ -2013,12 +3573,98 @@ fn formatear(d: Duration) -> String {
     }
 }
 
+/// Volumen propio de un audio dentro de un evento, en decibelios.
+fn ui_volumen_pista(ui: &mut egui::Ui, pista: &mut PistaEvento) {
+    let mut db = pista.volumen.as_db();
+    ui.add(
+        egui::Slider::new(&mut db, -60.0..=6.0)
+            .text("Volumen")
+            .suffix(" dB")
+            .custom_formatter(|v, _| format!("{:+.1} dB", v)),
+    );
+    pista.volumen = MilliDb::from_db(db);
+}
+
+/// Repetición de un evento: para siempre, una vez, o N veces.
+///
+/// El valor por defecto es **infinito** (`-1`): un evento suele ser un
+/// ambiente o una escena que se queda sonando, y es lo que el operador espera
+/// si no ha tocado nada.
+fn ui_repeticion_evento(ui: &mut egui::Ui, evento: &mut Evento) {
+    if !evento.tipo.usa_fade() {
+        ui.label(
+            egui::RichText::new("Un disparo único suena una sola vez: es un efecto, no un loop.")
+                .color(FG_MUTE)
+                .size(11.0),
+        );
+        evento.bucle = 1;
+        return;
+    }
+    if evento.tipo.cuantos_audios() == 0 {
+        // El fade out no tiene audio propio que repetir: sólo mueve el que ya
+        // suena, y eso no se repite.
+        ui.label(
+            egui::RichText::new(
+                "Un fade out sólo mueve el audio que ya está sonando: no hay nada que repetir.",
+            )
+            .color(FG_MUTE)
+            .size(11.0),
+        );
+        return;
+    }
+
+    let mut clase = if evento.infinito() { 0 } else if evento.bucle > 1 { 2 } else { 1 };
+    ui.radio_value(&mut clase, 0, "Para siempre (loop)");
+    ui.radio_value(&mut clase, 1, "Una sola vez");
+    ui.radio_value(&mut clase, 2, "N veces");
+    ui.add_space(6.0);
+
+    match clase {
+        0 => evento.bucle = BUCLE_INFINITO,
+        1 => evento.bucle = 1,
+        _ => {
+            let mut n = if evento.bucle > 1 { evento.bucle } else { 2 } as f32;
+            ui.add(egui::Slider::new(&mut n, 2.0..=20.0).text("Veces").suffix(" x"));
+            evento.bucle = n.round().max(2.0) as i32;
+        }
+    }
+
+    ui.label(
+        egui::RichText::new(format!("(bucle = {})", evento.bucle))
+            .color(FG_MUTE)
+            .size(11.0)
+            .monospace(),
+    );
+}
+
+/// Icono de cada tipo de evento.
+fn icono_de_tipo(tipo: TipoEvento) -> IconKind {
+    match tipo {
+        TipoEvento::FadeIn => IconKind::Entrada,
+        TipoEvento::FadeOut => IconKind::Salida,
+        TipoEvento::Crossfade => IconKind::Cruce,
+        TipoEvento::Golpe => IconKind::Rayo,
+    }
+}
+
+/// De cuánto es el paso de los botones − y + de la duración.
+///
+/// Un 10 % de la escena, redondeado a 250 ms y nunca menos de 250: así el
+/// ajuste se nota igual si la escena dura 2 s que si dura 2 minutos, y pulsar
+/// una vez siempre se oye.
+fn paso_de_duracion(d: Duration) -> u64 {
+    let bruto = (d.as_millis() as f64 * 0.10).round() as i64;
+    ((bruto / 250).max(1) * 250) as u64
+}
+
 fn combo_curva(ui: &mut egui::Ui, curva: &mut Curve) {
+    // Lineal va primero: es la opción por defecto y la única que la mayoría de
+    // los usuarios necesitan.
     egui::ComboBox::from_id_salt("curva")
-        .width(150.0)
+        .width(180.0)
         .selected_text(rotulo_curva(*curva))
         .show_ui(ui, |ui| {
-            for c in [Curve::EqualPower, Curve::Linear, Curve::Exponential] {
+            for c in [Curve::Linear, Curve::EqualPower, Curve::Exponential] {
                 ui.selectable_value(curva, c, rotulo_curva(c));
             }
         });
@@ -2026,58 +3672,165 @@ fn combo_curva(ui: &mut egui::Ui, curva: &mut Curve) {
 
 fn rotulo_curva(c: Curve) -> &'static str {
     match c {
-        Curve::EqualPower => "equal-power (recomendada)",
-        Curve::Linear => "lineal",
+        Curve::Linear => "lineal (recomendada)",
+        Curve::EqualPower => "equal-power",
         Curve::Exponential => "exponencial",
     }
 }
 
-fn duracion_de(spec: &CueSpec, por_defecto: Duration) -> Duration {
-    match spec.entrance {
-        Entrance::FadeIn { duration, .. } => duration,
-        Entrance::Hit => por_defecto,
-    }
+/// Las tres maneras de entrar que se le ofrecen al operador.
+///
+/// "Sube" y "Baja" sólo ponen los valores de partida: después los dos extremos
+/// se pueden dejar en cualquier par (30 → 70, 90 → 40…), que es lo que hace
+/// falta en teatro y lo que antes no se podía pedir.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TipoTransicion {
+    Golpe,
+    Sube,
+    Baja,
 }
 
-fn curva_de_entrada(spec: &CueSpec) -> Curve {
-    match spec.entrance {
-        Entrance::FadeIn { curve, .. } => curve,
-        Entrance::Hit => Curve::EqualPower,
-    }
-}
+fn ui_transicion(ui: &mut egui::Ui, spec: &mut CueSpec) {
+    let (mut desde, mut hasta, mut duracion, mut curva, clase_inicial) = match spec.entrance {
+        Entrance::Hit => (100u8, 100u8, Duration::from_secs(3), Curve::Linear, TipoTransicion::Golpe),
+        Entrance::FadeIn { duration, curve, from_percent, to_percent } => {
+            let clase = if to_percent >= from_percent {
+                TipoTransicion::Sube
+            } else {
+                TipoTransicion::Baja
+            };
+            (from_percent, to_percent, duration, curve, clase)
+        }
+    };
+    let mut clase = clase_inicial;
 
-fn ui_entrada(ui: &mut egui::Ui, spec: &mut CueSpec) {
-    ui.label(egui::RichText::new("Cómo entra este audio").color(FG_STRONG).size(15.0));
+    ui.radio_value(&mut clase, TipoTransicion::Golpe, "De golpe (sin fade)");
+    ui.radio_value(&mut clase, TipoTransicion::Sube, "Sube con fade");
+    ui.radio_value(&mut clase, TipoTransicion::Baja, "Baja con fade");
     ui.add_space(6.0);
 
-    let mut con_fade = matches!(spec.entrance, Entrance::FadeIn { .. });
-    ui.radio_value(&mut con_fade, false, "De golpe");
-    ui.radio_value(&mut con_fade, true, "Con fade in");
-    ui.add_space(8.0);
+    // Al cambiar de tipo se ponen los extremos que le tocan: si no, pasar de
+    // "sube" a "baja" dejaría una rampa plana que no haría nada.
+    if clase != clase_inicial {
+        (desde, hasta) = match clase {
+            TipoTransicion::Sube => (0, 100),
+            TipoTransicion::Baja => (100, 0),
+            TipoTransicion::Golpe => (100, 100),
+        };
+    }
 
-    if con_fade {
-        let mut duracion = duracion_de(spec, Duration::from_secs(3));
-        let mut curva = curva_de_entrada(spec);
-        ui.horizontal(|ui| {
-            slider_duracion(ui, &mut duracion, "Duración");
-        });
-        ui.horizontal(|ui| {
-            ui.label("Curva:");
-            combo_curva(ui, &mut curva);
-        });
-        spec.entrance = Entrance::FadeIn { duration: duracion, curve: curva };
-        ui.add_space(6.0);
+    if clase == TipoTransicion::Golpe {
         ui.label(
             egui::RichText::new(
-                "La curva equal-power mantiene la energía constante durante el cruce: \
-                 con una lineal se oye un bache de volumen en el centro.",
+                "Entra a pleno volumen desde la primera muestra: para un efecto puntual \
+                 (una explosión, un rayo, un portazo).",
             )
             .color(FG_MUTE)
             .size(11.0),
         );
-    } else {
+        ui.add_space(4.0);
+        // Atajo: un efecto es "de golpe, una vez y se acaba". Las tres cosas a
+        // la vez, que es lo que de verdad se quiere cuando se añade un trueno.
+        if ui.button("Hacerlo disparo único (efecto)").clicked() {
+            spec.entrance = Entrance::Hit;
+            spec.loop_mode = LoopMode::None;
+            spec.exit = ExitMode::UntilEnd;
+            spec.on_previous = OnPrevious::Keep;
+        }
         spec.entrance = Entrance::Hit;
+        return;
     }
+
+    slider_porcentaje(ui, "Desde", &mut desde);
+    slider_porcentaje(ui, "Hasta", &mut hasta);
+
+    ui.horizontal(|ui| {
+        if ui.small_button("Invertir").clicked() {
+            std::mem::swap(&mut desde, &mut hasta);
+        }
+        ui.label(
+            egui::RichText::new(format!("{desde} % → {hasta} %"))
+                .color(FG_STRONG)
+                .monospace(),
+        );
+    });
+
+    dibujar_rampa(ui, desde, hasta, curva);
+
+    ui.horizontal(|ui| {
+        slider_duracion(ui, &mut duracion, "Duración");
+    });
+    ui.horizontal(|ui| {
+        ui.label("Curva:");
+        combo_curva(ui, &mut curva);
+    });
+
+    spec.entrance = Entrance::FadeIn {
+        duration: duracion,
+        curve: curva,
+        from_percent: desde,
+        to_percent: hasta,
+    };
+
+    ui.add_space(4.0);
+    ui.label(
+        egui::RichText::new(
+            "Los dos extremos son libres: un ambiente puede quedarse al 60 % en vez de \
+             al 100 %, y una escena puede bajar hasta el 20 % sin apagarse del todo.",
+        )
+        .color(FG_MUTE)
+        .size(11.0),
+    );
+}
+
+/// Slider de porcentaje entero, 0–100.
+fn slider_porcentaje(ui: &mut egui::Ui, etiqueta: &str, valor: &mut u8) {
+    let mut v = *valor as f32;
+    ui.add(
+        egui::Slider::new(&mut v, 0.0..=100.0)
+            .text(etiqueta)
+            .step_by(1.0)
+            .custom_formatter(|v, _| format!("{} %", v.round() as i32)),
+    );
+    *valor = v.round().clamp(0.0, 100.0) as u8;
+}
+
+/// Dibuja la rampa que se va a oír, con la curva de verdad.
+///
+/// Se dibuja con la misma función que usa el audio: si se dibujara una recta
+/// cuando la curva es exponencial, el panel estaría mintiendo.
+fn dibujar_rampa(ui: &mut egui::Ui, desde: u8, hasta: u8, curva: Curve) {
+    let alto = 44.0;
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width().max(60.0), alto), egui::Sense::hover());
+    let p = ui.painter();
+    p.rect_filled(rect, egui::CornerRadius::same(4), BG_PANEL);
+
+    // Rejilla: las líneas de 0, 50 y 100 %.
+    for fraccion in [0.0f32, 0.5, 1.0] {
+        let y = rect.bottom() - fraccion * rect.height();
+        p.line_segment(
+            [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
+            egui::Stroke { width: 1.0, color: BG_ROW },
+        );
+    }
+
+    let sube = hasta >= desde;
+    let pasos = 40;
+    let mut puntos = Vec::with_capacity(pasos + 1);
+    for i in 0..=pasos {
+        let t = i as f32 / pasos as f32;
+        let forma = teatroplayer::engine::envelope::forma_de_curva(curva, t, sube);
+        let nivel = desde as f32 + (hasta as f32 - desde as f32) * forma;
+        puntos.push(egui::pos2(
+            rect.left() + t * rect.width(),
+            rect.bottom() - (nivel / 100.0) * rect.height(),
+        ));
+    }
+    p.add(egui::Shape::line(
+        puntos,
+        egui::Stroke { width: 2.0, color: GO_GREEN },
+    ));
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2089,19 +3842,14 @@ enum TipoAnterior {
 }
 
 fn ui_anterior(ui: &mut egui::Ui, spec: &mut CueSpec) {
-    ui.label(
-        egui::RichText::new("Qué pasa con lo que esté sonando")
-            .color(FG_STRONG)
-            .size(15.0),
-    );
-    ui.add_space(6.0);
-
-    let (mut tipo, mut duracion, mut curva, mut nivel) = match spec.on_previous {
-        OnPrevious::Keep => (TipoAnterior::Keep, Duration::from_secs(3), Curve::EqualPower, 30u8),
-        OnPrevious::FadeOut { duration, curve } => (TipoAnterior::FadeOut, duration, curve, 30),
-        OnPrevious::Stop => (TipoAnterior::Stop, Duration::from_secs(3), Curve::EqualPower, 30),
+    let (mut tipo, mut duracion, mut curva, mut nivel, mut espera) = match spec.on_previous {
+        OnPrevious::Keep => (TipoAnterior::Keep, Duration::from_secs(3), Curve::Linear, 30u8, Duration::ZERO),
+        OnPrevious::FadeOut { duration, curve, gap } => {
+            (TipoAnterior::FadeOut, duration, curve, 30, gap)
+        }
+        OnPrevious::Stop => (TipoAnterior::Stop, Duration::from_secs(3), Curve::Linear, 30, Duration::ZERO),
         OnPrevious::Duck { duration, curve, level_percent } => {
-            (TipoAnterior::Duck, duration, curve, level_percent)
+            (TipoAnterior::Duck, duration, curve, level_percent, Duration::ZERO)
         }
     };
 
@@ -2111,6 +3859,31 @@ fn ui_anterior(ui: &mut egui::Ui, spec: &mut CueSpec) {
     ui.radio_value(&mut tipo, TipoAnterior::Duck, "Baja de volumen (duck)");
     ui.add_space(8.0);
 
+    // Atajo para lo más pedido: que esta entre subiendo mientras la otra sale
+    // bajando, con la misma duración y la misma curva. A mano son cuatro
+    // controles en dos sitios distintos; aquí es un botón.
+    if ui.button("Crossfade: yo subo y la anterior baja").clicked() {
+        let (d, c) = match spec.entrance {
+            Entrance::FadeIn { duration, curve, .. } => (duration, curve),
+            Entrance::Hit => (Duration::from_secs(3), Curve::Linear),
+        };
+        // Si esta entrada entraba de golpe, se le pone su subida: un
+        // crossfade con un lado plano no es un crossfade.
+        if matches!(spec.entrance, Entrance::Hit) {
+            spec.entrance = Entrance::FadeIn {
+                duration: d,
+                curve: c,
+                from_percent: 0,
+                to_percent: 100,
+            };
+        }
+        duracion = d;
+        curva = c;
+        espera = Duration::ZERO;
+        tipo = TipoAnterior::FadeOut;
+    }
+    ui.add_space(6.0);
+
     if tipo == TipoAnterior::FadeOut || tipo == TipoAnterior::Duck {
         ui.horizontal(|ui| {
             slider_duracion(ui, &mut duracion, "Duración");
@@ -2119,6 +3892,30 @@ fn ui_anterior(ui: &mut egui::Ui, spec: &mut CueSpec) {
             ui.label("Curva:");
             combo_curva(ui, &mut curva);
         });
+    }
+    if tipo == TipoAnterior::FadeOut {
+        // El "gap" es lo que el usuario pidió: el tiempo entre que A termina
+        // su fade y B empieza a sonar. Sin gap, B entra justo cuando A calla;
+        // con gap, hay un silencio en medio.
+        ui.horizontal(|ui| {
+            // El icono de reloj (Espera) señala visualmente que esto es un
+            // retardo, no una rampa de volumen.
+            let icono_rect = ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::hover());
+            dibujar_icono(
+                ui.painter(),
+                icono_rect.0,
+                IconKind::Espera,
+                WARN_AMBER,
+            );
+            slider_duracion(ui, &mut espera, "Espera tras el fade");
+        });
+        ui.label(
+            egui::RichText::new(
+                "Esta entrada se dispara sola, después de que la anterior termine su fade out.",
+            )
+            .color(FG_MUTE)
+            .size(11.0),
+        );
     }
     if tipo == TipoAnterior::Duck {
         let mut pct = nivel as f32;
@@ -2133,7 +3930,11 @@ fn ui_anterior(ui: &mut egui::Ui, spec: &mut CueSpec) {
 
     spec.on_previous = match tipo {
         TipoAnterior::Keep => OnPrevious::Keep,
-        TipoAnterior::FadeOut => OnPrevious::FadeOut { duration: duracion, curve: curva },
+        TipoAnterior::FadeOut => OnPrevious::FadeOut {
+            duration: duracion,
+            curve: curva,
+            gap: espera,
+        },
         TipoAnterior::Stop => OnPrevious::Stop,
         TipoAnterior::Duck => {
             OnPrevious::Duck { duration: duracion, curve: curva, level_percent: nivel }
@@ -2150,16 +3951,14 @@ enum TipoSalida {
 
 fn ui_salida(ui: &mut egui::Ui, spec: &mut CueSpec, auto: &mut AutoFollow) {
     ui.label(
-        egui::RichText::new("Cómo sale cuando aprietas SALIR")
-            .color(FG_STRONG)
-            .size(15.0),
+        egui::RichText::new("Cuando aprietas SALIR").color(FG_MUTE).size(11.0),
     );
-    ui.add_space(6.0);
+    ui.add_space(4.0);
 
     let (mut tipo, mut duracion, mut curva) = match spec.exit {
-        ExitMode::UntilEnd => (TipoSalida::UntilEnd, Duration::from_secs(2), Curve::EqualPower),
+        ExitMode::UntilEnd => (TipoSalida::UntilEnd, Duration::from_secs(2), Curve::Linear),
         ExitMode::FadeOut { duration, curve } => (TipoSalida::FadeOut, duration, curve),
-        ExitMode::Hit => (TipoSalida::Hit, Duration::from_secs(2), Curve::EqualPower),
+        ExitMode::Hit => (TipoSalida::Hit, Duration::from_secs(2), Curve::Linear),
     };
 
     ui.radio_value(&mut tipo, TipoSalida::UntilEnd, "Se queda hasta el final");
@@ -2242,8 +4041,6 @@ enum TipoLoop {
 }
 
 fn ui_repeticion(ui: &mut egui::Ui, spec: &mut CueSpec) {
-    ui.label(egui::RichText::new("Repetición").color(FG_STRONG).size(15.0));
-    ui.add_space(6.0);
 
     let (mut tipo, mut cuenta) = match spec.loop_mode {
         LoopMode::None => (TipoLoop::None, 2u32),
@@ -2279,8 +4076,6 @@ fn ui_repeticion(ui: &mut egui::Ui, spec: &mut CueSpec) {
 }
 
 fn ui_volumen(ui: &mut egui::Ui, spec: &mut CueSpec) {
-    ui.label(egui::RichText::new("Volumen de esta pista").color(FG_STRONG).size(15.0));
-    ui.add_space(6.0);
 
     let mut db = spec.volume.as_db();
     ui.add(
@@ -2316,7 +4111,14 @@ fn resumir(spec: &CueSpec) -> String {
 
     partes.push(match spec.entrance {
         Entrance::Hit => "entra de golpe".to_string(),
-        Entrance::FadeIn { duration, .. } => format!("entra en {}", formatear(duration)),
+        // Con los dos extremos a la vista: un fade que va de 20 a 60 no se
+        // puede resumir diciendo sólo cuánto dura.
+        Entrance::FadeIn { duration, from_percent, to_percent, .. } => format!(
+            "{}→{} % en {}",
+            from_percent,
+            to_percent,
+            formatear(duration)
+        ),
     });
 
     match spec.on_previous {
@@ -2341,4 +4143,72 @@ fn resumir(spec: &CueSpec) -> String {
     }
 
     partes.join(" · ")
+}
+
+// ---------------------------------------------------------------------------
+// Pruebas de la interfaz
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// La guarda del clic fantasma, que es fácil de romper sin darse cuenta.
+    ///
+    /// El síntoma que evita: abrir el programa con el ratón pulsado en otra
+    /// ventana y que la pulsación, al soltarse encima, cambie de lista o
+    /// dispare algo. No se puede probar con una ventana de verdad, pero sí la
+    /// decisión, que es donde estaba el fallo.
+    #[test]
+    fn el_clic_que_venia_en_vuelo_no_es_fiable() {
+        let mut app = App::new();
+
+        // Sin haber visto ninguna pulsación todavía no se da por bueno nada.
+        assert_eq!(app.frame_pulsacion, None);
+        assert!(!app.clic_fiable());
+
+        // La pulsación que llegó en el primer frame es la que abrió la ventana
+        // (o el foco del sistema): no es del operador.
+        app.frame_pulsacion = Some(1);
+        assert!(!app.clic_fiable(), "la pulsación de apertura no debe accionar nada");
+
+        // Con la ventana ya en marcha, cualquier pulsación posterior es real.
+        app.frame_pulsacion = Some(2);
+        assert!(app.clic_fiable());
+        app.frame_pulsacion = Some(500);
+        assert!(app.clic_fiable());
+    }
+
+    /// El paso de los botones ± de la duración de un evento.
+    #[test]
+    fn el_paso_de_duracion_se_adapta_a_la_escena() {
+        // Escenas cortas: el mínimo de 250 ms, para que un toque se note.
+        assert_eq!(paso_de_duracion(Duration::from_millis(200)), 250);
+        assert_eq!(paso_de_duracion(Duration::from_millis(1000)), 250);
+        // Un 10 %, redondeado a 250 ms.
+        assert_eq!(paso_de_duracion(Duration::from_secs(3)), 250);
+        assert_eq!(paso_de_duracion(Duration::from_secs(5)), 500);
+        assert_eq!(paso_de_duracion(Duration::from_secs(8)), 750);
+        assert_eq!(paso_de_duracion(Duration::from_secs(60)), 6000);
+    }
+
+    /// El icono de cada tipo de evento, para que no se cruce ninguno.
+    #[test]
+    fn cada_tipo_de_evento_tiene_su_icono() {
+        let iconos: Vec<IconKind> =
+            TipoEvento::TODOS.iter().map(|t| icono_de_tipo(*t)).collect();
+        // Los cuatro tipos usan cuatro iconos distintos: si dos coincidieran,
+        // la lista de eventos dejaría de distinguirse de un vistazo.
+        for (i, a) in iconos.iter().enumerate() {
+            for (j, b) in iconos.iter().enumerate() {
+                if i != j {
+                    assert_ne!(
+                        std::mem::discriminant(a),
+                        std::mem::discriminant(b),
+                        "los tipos {i} y {j} comparten icono"
+                    );
+                }
+            }
+        }
+    }
 }

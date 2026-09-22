@@ -84,13 +84,13 @@ Sin sombras. Sin degradados. Las separaciones vienen del color y de las líneas 
 ├──────────────────────────────────────────────────────────┬─────────────────────────────┤
 │  #    NOMBRE                              PRE  ▶ DUR ▶ POST  GO    │ INSPECTOR            │
 │  ────────────────────────────────────────────────────────     │ ─────────              │
-│  1●   INTRO                               ─   4.0  ─    ▶   │   [Básico] [Fade] [Loop]  │
-│  2●   TRUENO                              ─   5.0  3.0  ▶   │                        │
-│ ▸3●   PREDANZA — VIENTO DEL ESTE          ─   2.0  2.0  ▶   │   Número   3             │
-│   4●   PARAGUAS — BALLET I                ─   3.0  ─    ▶   │   Color    ● teal       │
-│   5●   LLUVIA (∞)                         ─  10.0  ─    ▶   │   Nombre   PREDANZA…    │
-│  ────────────────────────────────────────────────────────     │   Archivo  PRE DANZA    │
-│                                                              │   [ Elegir audio… ]    │
+│  1●   INTRO                               ─   4.0  ─    ▶   │   ▸ Transición            │
+│  2●   TRUENO                              ─   5.0  3.0  ▶   │   Desde    0 %          │
+│ ▸3●   PREDANZA — VIENTO DEL ESTE          ─   2.0  2.0  ▶   │   Hasta  100 %          │
+│   4●   PARAGUAS — BALLET I                ─   3.0  ─    ▶   │   Duración 4.0 s        │
+│   5●   LLUVIA (∞)                         ─  10.0  ─    ▶   │   Curva    lineal       │
+│  ────────────────────────────────────────────────────────     │   ╱ rampa dibujada      │
+│                                                              │   ▸ Lo que suena        │
 │                                                              │                        │
 │  [+ Agregar audios…]   [↑][↓][⧉][🗑]   [ Imprimir ]          │   Pre-espera  0 ms    │
 │                                                              │   Post-espera 0 ms    │
@@ -106,8 +106,16 @@ Sin sombras. Sin degradados. Las separaciones vienen del color y de las líneas 
 
 - **Top bar (56 px):** nombre del programa, archivo, indicador de guardado, selector de salida, volumen máster, toggle Diseño/Función.
 - **Cue list (centro-izquierda):** filas de 48 px, color lateral de 4 px, número grande coloreado, columnas con la convención `PRE ▶ DURACIÓN ▶ POST` (la flecha es la línea de tiempo, robada de ZasCue).
-- **Inspector (centro-derecha, 360 px):** tabs arriba; abajo, los campos con label grande arriba y control grande abajo. "Elegir audio…" centrado, estilo ZasCue.
+- **Inspector (centro-derecha, 420 px):** **una sola columna con scroll, sin pestañas**. Las pestañas se probaron dos veces y las dos veces hubo que adivinar en cuál vivía el control que se buscaba; ahora cada bloque es una sección con icono y título (Transición, Lo que suena, Salida, Repetición, Volumen, Tecla y pads) y todo está a la vista. Los campos llevan label arriba y control grande abajo, y "Elegir audio…" va centrado, estilo ZasCue.
+- **Dos listas en el panel central:** una pestaña por lista, "**Audios**" (los archivos sueltos) y "**Eventos**" (escenas montadas: un audio que sube, que baja, un intercambio, o un disparo único de efecto). Son dos cosas distintas — el audio es el material, el evento es lo que se lanza — y por eso no van mezcladas. Cada lista tiene su inspector.
+- **En el editor de un evento, el lado que sale no se elige.** El crossfade y el fade out muestran una sección "Lo que está sonando" con un solo control — hasta qué volumen baja — y ninguna lista de audios: el que se va es el que suena en ese momento. Sólo el fade in, el crossfade y el disparo único piden elegir un audio, y lo piden en una sección aparte, "Audio que entra".
 - **Transport (72 px abajo):** los 4 botones (Anterior, Siguiente grande, Salir chico, STOP rojo a la derecha). A la derecha del todo, reloj de tiempo absoluto de la función (mm:ss.cs).
+
+> **Nota sobre el boceto.** El dibujo de arriba es la **dirección de diseño**, no una foto de la app: hay cosas que aún no existen (el botón `Imprimir`, las columnas `PRE ▶ DURACIÓN ▶ POST`, las esperas previas) y otras que salieron distintas al construirlas. Lo que **sí** refleja el estado real, y conviene no volver atrás:
+>
+> - el inspector es **una columna con secciones**, sin pestañas;
+> - el panel central tiene **dos listas**, Audios y Eventos, con su pestaña;
+> - el fade lleva **los dos extremos en porcentaje** (Desde / Hasta), no sólo 0 y 100.
 
 ## 5. Modo Función
 
@@ -184,11 +192,16 @@ Cada estado lleva **palabra + color** (no depende solo del color).
 
 | Concepto | Cómo se dice |
 |---|---|
-| Fade in | "Entra en ___ s" |
-| Fade out | "Sale en ___ s" |
-| Crossfade | "Entra ___ s mientras lo anterior sale en ___ s" |
+| Fade in | "Entra en ___ s" / "Sube con fade" |
+| Fade out | "Sale en ___ s" / "Baja con fade" |
+| Crossfade | "Entra ___ s mientras lo anterior sale en ___ s" / "Crossfade: yo subo y la anterior baja" |
+| Extremos del fade | "Desde ___ %" y "Hasta ___ %" — los dos son libres, no sólo 0 y 100 |
+| Lado que sale de un evento | "Lo que está sonando" + "Baja hasta ___ %" — nunca un audio que elegir |
+| Audio que entra | "Audio que entra" — el único que se elige |
 | Ducking | "Bajar lo que suena a ___ %" |
-| Loop | "Repetir" |
+| Disparo único | "De golpe (sin fade)" / "Hacerlo disparo único (efecto)" |
+| Loop | "Repetir" / "Para siempre (loop)" |
+| Duración de una escena | "Duración de la escena" + botones − / + en la fila del evento |
 | Pre-wait | "Esperar ___ s antes" |
 | Auto-follow | "Después, disparar la siguiente sola" |
 | Output device | "Salida" |

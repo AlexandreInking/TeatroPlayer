@@ -16,6 +16,12 @@ use rodio::{ChannelCount, SampleRate, Source};
 #[serde(rename_all = "camelCase")]
 pub enum Curve {
     /// `g = from + (to - from) * t`. Simple, sirve para fades cortos y evidentes.
+    ///
+    /// Es la curva **predeterminada** del programa: el cambio de volumen a
+    /// velocidad constante es lo que el usuario espera cuando no ha tocado
+    /// nada, y lo que la mayoría de los programas de teatro exponen como
+    /// única opción. Equal-power sigue disponible para quien la prefiera.
+    #[default]
     Linear,
     /// Curva exponencial (k = 4): arranca muy lento y cierra rápido.
     /// Útil para que un audio "aparezca de la nada".
@@ -23,7 +29,6 @@ pub enum Curve {
     /// Equal-power (S): `sin` para subidas, `1 - cos` para bajadas.
     /// En el punto medio ambas valen 0.707, así que la suma de potencias se
     /// mantiene constante y el crossfade no tiene bache de volumen.
-    #[default]
     EqualPower,
 }
 
@@ -130,6 +135,14 @@ pub(crate) fn shape_of(curve: Curve, t: f32, rising: bool) -> f32 {
             }
         }
     }
+}
+
+/// Forma de la curva, expuesta para que la interfaz pueda dibujar la rampa
+/// exacta que se va a oír, en vez de una recta que se le parece.
+///
+/// Es la misma función que usa el audio: si se dibujara otra, el dibujo mentiría.
+pub fn forma_de_curva(curve: Curve, t: f32, rising: bool) -> f32 {
+    shape_of(curve, t, rising)
 }
 
 /// `t` -> forma normalizada exponencial, 0..=1.

@@ -8,6 +8,7 @@
 
 pub mod diagnostico;
 pub mod engine;
+pub mod eventos;
 pub mod paquete;
 pub mod serde_util;
 pub mod sesion;

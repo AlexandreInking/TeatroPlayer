@@ -73,6 +73,22 @@ Lo que falta es el mínimo: **una lista de audios con entradas y salidas configu
 - Pistas de video, subtítulos, luces.
 - macOS / Linux (quedan posibles, no construidos).
 
+### Qué añade la 0.2
+
+- **Eventos predefinidos**: escenas montadas con un audio, guardadas con la
+  obra y reutilizables. Cuatro tipos: fade in, crossfade, **fade out** (que baja
+  lo que esté sonando, sin elegir audio) y **disparo único** (efecto de golpe,
+  sin fade). Sólo los tres de entrada o intercambio piden elegir un audio. Ver
+  FR-17.
+- **Segunda lista** en el panel central: *Audios* y *Eventos*, cada una con su
+  editor.
+- **Extremos del fade en porcentaje**: la rampa puede ir de cualquier valor a
+  cualquier otro, no sólo de 0 a 100.
+- **Panel derecho rediseñado**: una columna con secciones en vez de pestañas,
+  con la rampa dibujada tal como se va a oír.
+- **Formato de sesión v2**. Las sesiones de la v1 se abren y se migran solas;
+  una build vieja abre una v2 en sólo lectura en vez de borrar los eventos.
+
 ## 6. Posicionamiento competitivo
 
 Investigación completa en `10-competencia-y-benchmark.md`. Resumen:
@@ -102,7 +118,7 @@ Investigación completa en `10-competencia-y-benchmark.md`. Resumen:
 |---|---|
 | Tiempo desde "abrir el programa" hasta "suena el primer audio con fade" | < 60 s |
 | Tamaño del instalador | < 8 MB |
-| RAM en reposo con 20 pistas cargadas | < 60 MB — **no alcanzable**; medido ~140 MB estables, y una ventana egui vacía ya son 139,9 MB (ver riesgo R16 en `09`) |
+| RAM en reposo con 20 pistas cargadas | < 150 MB. **Presupuesto corregido el 2026-09-22:** el original de < 60 MB no es alcanzable con esta pila y se decidió subirlo en vez de cambiar de toolkit. Medido ~140 MB estables, y una ventana egui **vacía** ya son 139,9 MB, así que el motor, el paquete, la sesión y la interfaz de la app caben dentro del ruido de medida: el coste es de eframe + glow/OpenGL, no del código propio. El motor sin interfaz (`tp-spike`) usa 15 MB. Ver riesgo R16 en `09` |
 | Arranque en frío | < 1 s |
 | Una persona sin conocimiento de audio ejecuta una sesión de 10 entradas sin ayuda | Sí, en el primer intento |
 | Caídas de audio (glitches/underruns) en una función de 90 min | 0 |

@@ -15,10 +15,10 @@
 #
 # Uso:
 #   powershell -ExecutionPolicy Bypass -File scripts\publicar.ps1
-#   powershell -ExecutionPolicy Bypass -File scripts\publicar.ps1 -Version 0.2.0
+#   powershell -ExecutionPolicy Bypass -File scripts\publicar.ps1 -Version 0.3.0
 
 param(
-    [string]$Version = "0.1.0"
+    [string]$Version = "0.3.0"
 )
 
 $ErrorActionPreference = "Stop"
@@ -77,16 +77,14 @@ Write-Host "[4/5] ZIP portable..."
 python tools\portable_zip.py
 if ($LASTEXITCODE -ne 0) { Write-Host "      AVISO: no se genero el ZIP" }
 
-$makensis = (Get-Command makensis -ErrorAction SilentlyContinue).Source
-if (-not $makensis) {
-    foreach ($c in @("C:\Program Files (x86)\NSIS\makensis.exe", "C:\Program Files\NSIS\makensis.exe")) {
-        if (Test-Path $c) { $makensis = $c; break }
-    }
-}
+. "$PSScriptRoot\nsis.ps1"
+$makensis = Buscar-Makensis
 
 if ($makensis) {
     Write-Host "[5/5] instalador NSIS..."
-    & $makensis "installer\teatroplayer.nsi"
+    # /DRAIZ con la ruta absoluta: NSIS une las rutas relativas con la carpeta del
+    # script, asi que sin esto el .nsi depende de la estructura de carpetas.
+    & $makensis "/DRAIZ=$raiz" "installer\teatroplayer.nsi"
     if ($LASTEXITCODE -eq 0) {
         $inst = "target\release\TeatroPlayer-Instalador.exe"
         if (Test-Path $inst) {
@@ -101,8 +99,10 @@ if ($makensis) {
     }
 } else {
     Write-Host "[5/5] instalador NSIS: NO COMPILADO"
-    Write-Host "      hace falta NSIS:  winget install NSIS.NSIS"
-    Write-Host "      y despues:        powershell -File scripts\instalador.ps1"
+    Write-Host "      hace falta NSIS. Dos formas:"
+    Write-Host "        con permisos : winget install NSIS.NSIS"
+    Write-Host "        sin permisos : descargar el ZIP de nsis.sourceforge.io,"
+    Write-Host "                       descomprimir y definir NSIS_DIR"
 }
 
 # --- resumen ----------------------------------------------------------------

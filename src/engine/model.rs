@@ -56,12 +56,35 @@ pub enum Entrance {
     /// De golpe, a volumen pleno.
     #[default]
     Hit,
-    /// Aparece desde el silencio.
+    /// Rampa de `from_percent` a `to_percent`.
+    ///
+    /// Los dos extremos son configurables a propósito: un fade no tiene por
+    /// qué ir siempre del silencio al 100 %. Un ambiente puede entrar de 0 a
+    /// 60 %, y una escena que se va puede bajar de 80 a 20 en vez de apagarse
+    /// del todo. Antes los extremos eran fijos (0 y 100) y cualquier otra cosa
+    /// había que simularla bajando el volumen de la pista, que no es lo mismo:
+    /// el volumen se aplica antes y no cambia la forma de la rampa.
+    ///
+    /// Ambos llevan `#[serde(default)]`: una sesión antigua, que sólo guardaba
+    /// `durationMs` y `curve`, se abre como un fade 0 → 100 %, que es exactamente
+    /// lo que hacía antes.
     FadeIn {
         #[serde(rename = "durationMs", with = "crate::serde_util::ms")]
         duration: Duration,
+        #[serde(default)]
         curve: Curve,
+        /// Volumen al empezar la rampa, 0–100 %.
+        #[serde(default, rename = "fromPercent")]
+        from_percent: u8,
+        /// Volumen al terminar la rampa, 0–100 %.
+        #[serde(default = "cien", rename = "toPercent")]
+        to_percent: u8,
     },
+}
+
+/// 100 %, para los `#[serde(default = …)]` del modelo.
+pub(crate) const fn cien() -> u8 {
+    100
 }
 
 /// Qué le pasa a la pista que estaba sonando cuando entra esta.
@@ -75,11 +98,19 @@ pub enum OnPrevious {
     /// Se queda sonando y se encima.
     #[default]
     Keep,
-    /// Sale con fade.
+    /// Sale con fade y, si se quiere, yo entro mas tarde.
+    ///
+    /// `gap` es la espera **desde que la anterior termina su fade** hasta que yo
+    /// arranco. Con el sale tal cual la receta "B entra X segundos despues de que
+    /// A haya terminado su fade out", sin que el operador calcule nada: el retardo
+    /// total es `duration + gap`.
     FadeOut {
         #[serde(rename = "durationMs", with = "crate::serde_util::ms")]
         duration: Duration,
         curve: Curve,
+        /// Espera despues de que la anterior termine su fade.
+        #[serde(default, rename = "gapMs", with = "crate::serde_util::ms")]
+        gap: Duration,
     },
     /// Corte seco inmediato.
     Stop,
@@ -195,12 +226,61 @@ pub struct CueSpec {
     pub exit: ExitMode,
     #[serde(default)]
     pub loop_mode: LoopMode,
+    /// Si se indica, la pista se acaba sola pasados esos milisegundos **desde
+    /// que arranca**, sin que el operador tenga que darle a SALIR.
+    ///
+    /// Existe para los eventos con una duración cerrada (un fade out que
+    /// termina en silencio, el lado que se apaga de un crossfade): sin esto la
+    /// pista seguiría sonando en silencio hasta el final del archivo, gastando
+    /// una pista del mezclador para nada.
+    #[serde(default, rename = "stopAfterMs", with = "crate::serde_util::ms_opt")]
+    pub stop_after: Option<Duration>,
 }
 
 impl CueSpec {
+    /// Cuánto tarda esta entrada en empezar a sonar desde que se dispara.
+    ///
+    /// Solo hay retardo cuando la anterior sale con fade: primero baja ella y, si
+    /// se pidio hueco, espero ese hueco antes de entrar yo.
+    pub fn retardo_de_entrada(&self) -> Duration {
+        match self.on_previous {
+            OnPrevious::FadeOut { duration, gap, .. } => duration + gap,
+            _ => Duration::ZERO,
+        }
+    }
+
     /// Entrada mínima: entra de golpe, se encima, y suena hasta el final.
     pub fn simple() -> Self {
         Self::default()
+    }
+
+    /// Entrada que hace una rampa de `desde`% a `hasta`% en `duration`.
+    ///
+    /// Es la que construyen los eventos: un evento es, en el fondo, una o dos
+    /// de estas con una duración común.
+    pub fn con_rampa(desde: u8, hasta: u8, duration: Duration, curve: Curve) -> Self {
+        Self {
+            entrance: Entrance::FadeIn {
+                duration,
+                curve,
+                from_percent: desde,
+                to_percent: hasta,
+            },
+            ..Self::default()
+        }
+    }
+
+    /// Los dos extremos de la rampa de entrada, en tanto por uno (0.0–1.0).
+    ///
+    /// Con `Entrance::Hit` no hay rampa: el audio entra ya a pleno volumen, así
+    /// que los dos extremos son 1.0.
+    pub fn extremos_de_entrada(&self) -> (f32, f32) {
+        match self.entrance {
+            Entrance::FadeIn { from_percent, to_percent, .. } => {
+                (from_percent as f32 / 100.0, to_percent as f32 / 100.0)
+            }
+            Entrance::Hit => (1.0, 1.0),
+        }
     }
 
     /// Ganancia estática que hay que aplicar antes de la envolvente.
@@ -240,5 +320,57 @@ mod tests {
         assert_eq!(c.on_previous, OnPrevious::Keep);
         assert_eq!(c.exit, ExitMode::UntilEnd);
         assert_eq!(c.loop_mode, LoopMode::None);
+        assert_eq!(c.stop_after, None);
+    }
+
+    #[test]
+    fn un_fade_puede_ir_de_cualquier_porcentaje_a_cualquiera() {
+        let c = CueSpec::con_rampa(20, 60, Duration::from_millis(2500), Curve::Linear);
+        assert_eq!(c.extremos_de_entrada(), (0.2, 0.6));
+
+        let json = serde_json::to_string(&c).unwrap();
+        assert!(json.contains("\"fromPercent\":20"), "json: {json}");
+        assert!(json.contains("\"toPercent\":60"), "json: {json}");
+
+        let vuelta: CueSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(vuelta, c, "el round-trip no es exacto");
+    }
+
+    #[test]
+    fn un_fade_antiguo_sin_porcentajes_se_abre_como_cero_a_cien() {
+        // Sesiones guardadas antes de que existieran `fromPercent`/`toPercent`:
+        // deben abrir como un fade completo, que es lo que hacían entonces.
+        let json = r#"{"kind":"fadeIn","durationMs":4000,"curve":"linear"}"#;
+        let e: Entrance = serde_json::from_str(json).expect("debe abrir igual");
+        assert_eq!(
+            e,
+            Entrance::FadeIn {
+                duration: Duration::from_millis(4000),
+                curve: Curve::Linear,
+                from_percent: 0,
+                to_percent: 100,
+            }
+        );
+    }
+
+    #[test]
+    fn el_corte_automatico_se_guarda_en_milisegundos_y_puede_no_estar() {
+        let mut c = CueSpec::simple();
+        c.stop_after = Some(Duration::from_millis(3200));
+        let json = serde_json::to_string(&c).unwrap();
+        assert!(json.contains("\"stopAfterMs\":3200"), "json: {json}");
+
+        let vuelta: CueSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(vuelta.stop_after, Some(Duration::from_millis(3200)));
+
+        // Y una sesión sin el campo abre con `None`, sin reventar.
+        let vieja: CueSpec = serde_json::from_str("{}").unwrap();
+        assert_eq!(vieja.stop_after, None);
+    }
+
+    #[test]
+    fn un_golpe_no_tiene_rampa() {
+        // `Hit` entra a pleno volumen: los dos extremos valen 1.0.
+        assert_eq!(CueSpec::simple().extremos_de_entrada(), (1.0, 1.0));
     }
 }

@@ -20,12 +20,17 @@ MiObra.tpshow    (ZIP, método STORE, determinista)
 
 ## 2. `sesion.json`
 
-Versión de formato: `1`.
+Versión de formato: `3`.
+
+| Versión | Qué cambió | Migración |
+|---|---|---|
+| **2** | Añade la lista `eventos` (§5). | v1→v2 **no convierte nada**: todos los campos nuevos llevan valor por defecto. El número sube igualmente, para que una build antigua abra una sesión nueva en sólo lectura en vez de guardarla por encima borrando los eventos. |
+| **3** | Los eventos dejan de elegir el audio que sale: el crossfade guarda sólo el que entra y el fade out ninguno, con el volumen objetivo en `salidaPct`. | v2→v3 **sí convierte**: ver §5. Sin convertir, el audio que salía se leería como el que entra. |
 
 ```jsonc
 {
   "format": "teatroplayer-session",
-  "version": 1,
+  "version": 3,
   "id": "8f1c…",
   "name": "MiObra",
   "createdAt": "2026-09-20T15:00:00-05:00",
@@ -59,10 +64,14 @@ Versión de formato: `1`.
 
       "volumeDb": -3.0,
 
+      "stopAfterMs": null,         // opcional: la pista se corta sola pasados N ms
+
       "entrance": {
         "kind": "fadeIn",         // hit | fadeIn
         "durationMs": 4000,
-        "curve": "equalPower"     // linear | exponential | equalPower
+        "curve": "equalPower",     // linear | exponential | equalPower
+        "fromPercent": 0,          // opcional (defecto 0): volumen al empezar la rampa
+        "toPercent": 100           // opcional (defecto 100): volumen al terminar
       },
 
       "onPrevious": {
@@ -90,7 +99,9 @@ Versión de formato: `1`.
       },
       "pad": false                      // true = también aparece en la franja de efectos (B3)
     }
-  ]
+  ],
+
+  "eventos": []                         // v2+: escenas predefinidas, ver §5
 }
 ```
 
@@ -105,7 +116,91 @@ Versión de formato: `1`.
 - `loop.mode = infinite` + `entrance.fadeIn` = ambiente que aparece de a poco y se queda.
 - `pad: true` hace que la entrada aparezca también en la franja inferior de **Efectos** (siempre lista, se dispara fuera de la secuencia). No la saca de la lista.
 - `autoFollow` con `whenThisEnds` solo es válido si la entrada **no** tiene loop infinito (si no, nunca termina y nunca dispara la siguiente).
+- `fromPercent` / `toPercent` son los dos extremos de la rampa y **no tienen por
+  qué ser 0 y 100**: un ambiente puede entrar de 0 a 60 %, y una escena puede
+  bajar de 100 a 20 sin apagarse del todo. Una sesión anterior, que no guardaba
+  estos dos campos, se abre como `0 → 100`, que es lo que hacía antes.
+- `stopAfterMs` corta la pista sola pasados N ms desde que arranca. Lo ponen los
+  eventos cuya rampa acaba en silencio, para que la pista no siga ocupando el
+  mezclador en silencio. `null` (o ausente) = suena hasta el final.
 - Todo tiempo se guarda en **ms enteros** (evita ruido de punto flotante al re-guardar).
+
+## 5. Eventos predefinidos (v3)
+
+Un **audio** es un archivo; un **evento** es una escena montada con uno de esos
+archivos y una rampa de volumen. Los eventos se guardan con la obra, se
+reutilizan y se editan sin rehacerse: para alargar una escena se mueve
+`duracionMs` y nada más.
+
+### La regla: quién elige audio y quién no
+
+**Sólo tres tipos piden elegir un audio** — entrada o intercambio:
+
+| Tipo | Audios que se eligen | Qué hace |
+|---|---|---|
+| `fadeIn` | **1**, el que entra | Aparece poco a poco. |
+| `crossfade` | **1**, el que entra | Entra el nuevo mientras se va el que sonaba. |
+| `golpe` | **1**, el que suena de golpe | Disparo único, sin fade. |
+| `fadeOut` | **0** | Baja **lo que esté sonando** en ese momento. |
+
+En el crossfade y el fade out, **el audio de base no se elige ni se guarda**:
+es el que está sonando cuando se lanza el evento, y su punto de partida es
+"donde esté sonando ahora", que no se sabe hasta ese instante. Del lado que
+sale lo único configurable es el volumen al que llega, `salidaPct`.
+
+```jsonc
+{
+  "nombre": "Cambio de escena",
+  "tipo": "crossfade",          // fadeIn | fadeOut | crossfade | golpe
+  "duracionMs": 8000,           // la rampa entera: éste es el número de la escena
+  "curva": "linear",            // linear | exponential | equalPower
+  "bucle": -1,                  // -1 = infinito (defecto); 0|1 = una vez; N = N veces
+  "salidaPct": 0,               // volumen al que va LO QUE YA SUENA (0 = se apaga y se corta)
+  "nota": "",
+  "tecla": "F3",                // opcional
+  "pad": true,                  // aparece en la franja de pads
+
+  "pistas": [                   // 1 audio en fadeIn/crossfade/golpe; 0 en fadeOut
+    {
+      "audio":  { "fileName": "03_viento.wav", "relPath": "audio/03_viento.wav" },
+      "nombre": "Viento",
+      "volumeDb": 0.0,
+      "desdePct": 0,            // el nuevo pasa de no sonar…
+      "hastaPct": 100           // …a sonar
+    }
+  ]
+}
+```
+
+### Notas de los eventos
+
+- `pistas` tiene **como mucho un elemento**. No es una lista por comodidad: es
+  que nunca hay más de un audio que elegir.
+- `salidaPct` es lo único que se configura del lado que sale. Si vale `0`, la
+  pista se apaga y **se corta** al terminar la rampa; si no, se queda sonando a
+  ese volumen (una música que baja al 25 % y se queda de fondo).
+- `duracionMs` y `curva` son **una sola** para los dos lados: es lo que hace que
+  un crossfade sea un crossfade y no dos fades seguidos.
+- `tipo: "golpe"` es el **disparo único**: entra de golpe, sin fade, una sola
+  vez, y se monta sobre lo que ya esté sonando (una explosión, un rayo, un
+  portazo). Aunque el evento esté en `bucle: -1`, un golpe nunca se repite.
+- Un evento **no** apaga lo que suene por su cuenta: sólo lo toca a través de
+  `salidaPct`, que es explícito. Si además apagara cosas por su cuenta, lanzar
+  un evento en medio de una función cortaría algo que nadie mandó cortar. Para
+  cortar está el botón de parada.
+- El evento guarda el `fileName` del audio, no el archivo: si ese audio deja de
+  estar en la obra, el evento se ve como incompleto en vez de fallar al
+  lanzarse. Un `fadeOut` no puede quedarse sin audio, porque no usa ninguno.
+- `fadeOut` y el lado que sale del `crossfade` actúan sobre **todas** las pistas
+  que estén sonando, no sólo sobre la última que entró.
+
+### Migración de la v2
+
+La v2 guardaba el crossfade como `pistas = [el que sale, el que entra]` y el
+fade out con un audio. La v3 conserva **el que entra** y pasa el volumen
+objetivo del que salía a `salidaPct`; el fade out se queda con `pistas = []`.
+Sin esa conversión, el audio que salía se leería como el que entra y el evento
+sonaría al revés. Ver `migrar_v2_a_v3` en `src/sesion/modelo.rs`.
 
 ## 3. Vinculación a archivos de audio (el "guardado vinculante")
 

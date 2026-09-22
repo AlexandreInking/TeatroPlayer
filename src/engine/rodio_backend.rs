@@ -432,7 +432,16 @@ impl RodioBackend {
         // sobre 0..1 y el volumen de la pista no altera la forma de la curva.
         let amplificado = saltado.amplify(spec.static_gain());
 
-        let (live, control) = LiveGain::with_entrance(amplificado, 1.0, Some(spec.entrance));
+        // Corte automático: la pista se acaba sola al llegar a `stop_after`.
+        // Va aquí, en la cadena de audio, y no en un temporizador: el corte
+        // cae exactamente en una muestra, es determinista y no depende de que
+        // la UI esté repintando.
+        let cortado: Box<dyn Source<Item = f32> + Send> = match spec.stop_after {
+            Some(d) if d > Duration::ZERO => Box::new(amplificado.take_duration(d)),
+            _ => Box::new(amplificado),
+        };
+
+        let (live, control) = LiveGain::with_entrance(cortado, 1.0, Some(spec.entrance));
         Ok((Box::new(live), control))
     }
 }

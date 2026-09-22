@@ -3,11 +3,17 @@
 > Reproductor de audio para teatro con **fade in / fade out / crossfades en tiempo real**, pensado para que lo opere alguien que "sabe poco y no tiene mucho".
 > Local, instalable, se abre en el escritorio, sin consola, ultraligero y visualmente simple.
 
-**Estado:** diseño cerrado + **hitos SPIKE (8/8), ENG (5/5), FMT (6/7), SES (6/6), SHOW (6/6), OPS (5/5), REL (6/6) y
-UI (10/10) completados**. **La app ya se puede usar en una obra.** Se abre con doble clic desde
-`TeatroPlayer.lnk`, carga una carpeta de audios, los suena con fades y crossfades, y **guarda la obra
+**Estado:** diseño cerrado + **hitos SPIKE (8/8), ENG (5/5), FMT (7/7), SES (6/6), SHOW (6/6), OPS (5/5), REL (6/6),
+UI (10/10) y EVT (7/7) completados**. **La app ya se puede usar en una obra.** Se abre con doble clic desde
+`TeatroPlayer.lnk`, carga una carpeta de audios, los suena con fades y crossfades, monta **eventos
+predefinidos** (escenas montadas con un audio, guardadas y reutilizables), y **guarda la obra
 entera en un único `.tpshow`** con los audios dentro: se manda por WhatsApp y funciona en cualquier
-máquina. **113 tests en verde** (más 1 ignorado: el de 5 GB).
+máquina. **Versión 0.3.0. 151 tests en verde** (más 1 ignorado: el de 5 GB).
+
+Los tres artefactos de la release se generan y se verifican (instalador NSIS de 2,83 MB, ZIP
+portable de 3,4 MB, ejecutable de 7,7 MB sin consola), pero **el release todavía no se ha
+publicado**: falta configurar el remoto de Git y decidir el presupuesto de RAM (riesgo R16).
+Detalle en `14-como-publicar.md` §6 y §7.
 
 **Desarrollo completo: todos los hitos cerrados y los huecos técnicos resueltos** (ZIP64
 probado con 5 GB, y guardar una obra abierta desde un paquete).
@@ -30,11 +36,12 @@ cuenta sin administrador, y subir el release con su código fuente (obligación 
 Un único ejecutable que:
 
 1. Carga una carpeta de audios y los muestra como una **lista de entradas** (playlist).
-2. Permite configurar **cómo entra** cada audio: de golpe, con fade in (0.1 s – 60 s), o **crossfade** contra el audio que está sonando.
+2. Permite configurar **cómo entra** cada audio: de golpe, con fade in (0.1 s – 60 s), o **crossfade** contra el audio que está sonando. La rampa va **de cualquier porcentaje a cualquier otro**, no sólo de 0 a 100.
 3. Permite configurar **cómo sale**: de golpe, con fade out, o que se quede sonando.
 4. Opcionalmente **hace loop** de un audio (infinito o N veces) para ambientes.
-5. Guarda todo eso en una **sesión** (`.tpshow`) que se abre con doble clic y **lleva los audios dentro**, de modo que el operador solo tiene que apretar botones.
-6. Sale por la **salida de audífonos** de la laptop (que en teatro va con cable directo a la consola).
+5. Monta **eventos predefinidos** en una segunda lista: un audio que entra (fade in), un **intercambio** con el que está sonando (crossfade), un **fade out** que baja lo que suena sin elegir nada, o un **disparo único** sin fade para efectos de golpe. Se guardan con la obra y se editan sobre la marcha: alargar una escena es mover un número.
+6. Guarda todo eso en una **sesión** (`.tpshow`) que se abre con doble clic y **lleva los audios dentro**, de modo que el operador solo tiene que apretar botones.
+7. Sale por la **salida de audífonos** de la laptop (que en teatro va con cable directo a la consola).
 
 Dos modos de uso: **Diseño** (quien arma la sesión) y **Función** (quien la ejecuta: botones gigantes, sin menús).
 

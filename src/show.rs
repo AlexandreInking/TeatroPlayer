@@ -148,6 +148,17 @@ impl Programador {
         }
     }
 
+    /// Programa la entrada `i` para que arranque a los `en_ms` (tiempo
+    /// monótono). Se usa cuando el `on_previous` pide un retardo: la pista
+    /// anterior está saliendo y la nueva espera su turno.
+    ///
+    /// Sobreescribe cualquier cita pendiente: si hay un auto-follow pendiente
+    /// y el operador dispara una entrada con retardo, el auto-follow se
+    /// reemplaza. Es lo predecible: lo último que pidió el operador gana.
+    pub fn demorar_entrada(&mut self, i: usize, en_ms: u64) {
+        self.cita = Some(Cita { indice: i, en_ms: Some(en_ms) });
+    }
+
     /// Entrada que ya toca disparar por haber pasado su tiempo.
     pub fn vencida(&mut self, ahora_ms: u64) -> Option<usize> {
         match self.cita {
@@ -300,6 +311,31 @@ mod tests {
         p.al_arrancar(0, AutoFollow::AfterMs(100), 0, true);
         p.cancelar();
         assert_eq!(p.vencida(10_000), None);
+    }
+
+    #[test]
+    fn demorar_entrada_agenda_la_misma_entrada_no_la_siguiente() {
+        let mut p = Programador::nuevo();
+        // La receta "B entra X segundos después de que A haya terminado su
+        // fade out": agendamos B, no la siguiente. Antes y después de la
+        // demora B es la cita, así que el tick puede dispararla sin confusión
+        // con un auto-follow.
+        p.demorar_entrada(3, 5_000);
+        assert_eq!(p.pendiente(), Some(Cita { indice: 3, en_ms: Some(5_000) }));
+
+        assert_eq!(p.vencida(4_999), None, "aún no toca");
+        assert_eq!(p.vencida(5_000), Some(3), "justo en el instante, dispara B");
+        assert_eq!(p.vencida(6_000), None, "ya se consumió");
+    }
+
+    #[test]
+    fn demorar_entrada_pisa_un_auto_follow_anterior() {
+        // El operador primero confió en el auto-follow y luego corrigió a mano
+        // con un GO demorado: lo último que pidió gana.
+        let mut p = Programador::nuevo();
+        p.al_arrancar(0, AutoFollow::WhenThisEnds, 100, true);
+        p.demorar_entrada(1, 1_500);
+        assert_eq!(p.pendiente(), Some(Cita { indice: 1, en_ms: Some(1_500) }));
     }
 
     #[test]

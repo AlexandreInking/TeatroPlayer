@@ -26,6 +26,25 @@ pub mod ms {
     }
 }
 
+/// `Option<Duration>` <-> milisegundos enteros, `null` si no hay.
+///
+/// Se usa para "corta esta pista pasados N ms": es opcional porque la
+/// inmensa mayoría de las entradas suenan hasta el final de su audio.
+pub mod ms_opt {
+    use super::*;
+
+    pub fn serialize<S: Serializer>(d: &Option<Duration>, s: S) -> Result<S::Ok, S::Error> {
+        match d {
+            Some(v) => s.serialize_u64(v.as_millis() as u64),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Duration>, D::Error> {
+        Ok(Option::<u64>::deserialize(d)?.map(Duration::from_millis))
+    }
+}
+
 /// `MilliDb` <-> decibelios con decimales.
 ///
 /// En memoria son milidecibelios enteros; en el JSON salen como `-3.0`, que es

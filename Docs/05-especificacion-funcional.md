@@ -28,9 +28,23 @@ Ejemplos de resumen que se muestran en la fila (texto, no íconos crípticos):
 
 - Rango: **0.1 s a 60.0 s**.
 - Control: deslizador + campo numérico editable. Pasos: 0.1 s hasta 2 s · 0.5 s hasta 10 s · 1 s hasta 60 s.
-- Curva: Lineal / Exponencial / Equal-power. Predeterminado: **Equal-power**.
+- Curva: Lineal / Exponencial / Equal-power. Predeterminado: **Lineal** (el usuario pidió explícitamente que el volumen suba o baje a velocidad constante).
 - Valor 0 ⇒ "entra de golpe" (equivalente a `hit`).
 - Siempre se aplica un **anti-clic** de 5 ms al arrancar, incluso en entradas de golpe.
+
+### Extremos del fade configurables (P1)
+
+Los dos extremos de la rampa son **libres**, en porcentaje (0–100), no sólo
+0 y 100:
+
+- **Desde ___ %** y **Hasta ___ %**, con un botón *Invertir* para darle la
+  vuelta a la rampa.
+- Se dibuja la rampa con la curva real: lo que se ve es lo que se va a oír.
+- Casos que habilita: un ambiente que entra de 0 a 60 % y se queda ahí; una
+  escena que baja de 100 a 20 sin apagarse del todo; una pista que ya suena y
+  se recoloca a otro nivel.
+- El volumen de la pista se sigue aplicando **antes** de la envolvente, así que
+  estos porcentajes no cambian la forma de la curva.
 
 ## FR-04 — Fade out (P1)
 
@@ -44,10 +58,10 @@ Ejemplos de resumen que se muestran en la fila (texto, no íconos crípticos):
 
 - Se configura **en la entrada que entra**, no en la que sale. Es más fácil de explicar: *"esta entrada entra en 5 s y saca a la anterior en 3 s"*.
 - Cuando se dispara una entrada con `onPrevious.kind = fadeOut`:
-  - Si **hay una pista activa**, se le aplica la rampa de salida con su duración y curva.
-  - Si **hay varias**, se aplica a la **última que entró** (comportamiento predecible). *(P2: selector explícito de qué pista sacar.)*
-  - Si **no hay ninguna**, la configuración se ignora sin error.
+  - Se aplica la rampa de salida a **todo lo que esté sonando** en ese momento, no sólo a la última que entró. Si hay un ambiente de fondo y una voz, los dos se van: es lo que se espera de un cambio de escena.
+  - Si **no hay ninguna pista sonando**, la configuración se ignora sin error.
 - Las duraciones de entrada y salida son **independientes** (5 s / 3 s es válido).
+- El **volumen al que llega** la pista que sale es fijo: 0 (se apaga y se corta). Para dejarla a un nivel —una música que baja al 25 % y se queda de fondo— está `onPrevious.kind = duck`, o un **evento** de crossfade/fade out, que sí llevan su volumen objetivo.
 
 ### Matriz de combinaciones (las que el usuario pidió textualmente)
 
@@ -175,3 +189,79 @@ Motivo único: **cada una agrega un concepto que el operador tendría que entend
 - Salida multicanal a interfaz USB (4+ canales).
 - Salida simultánea a dos dispositivos (consola + retorno).
 - macOS y Linux.
+
+## FR-17 — Eventos predefinidos (P1)
+
+Un **audio** es un archivo suelto; un **evento** es una escena ya montada con
+uno de esos audios. Se crean una vez, se guardan con la obra y se lanzan desde
+su lista, desde los pads o con una tecla F.
+
+### Sólo tres tipos piden audio
+
+La regla: **entrada o intercambio**. El resto se resuelve con el audio que ya
+está en reproducción.
+
+| Tipo | Audios que se eligen | Qué hace |
+|---|---|---|
+| **Fade in** | **1**, el que entra | Aparece poco a poco, del volumen que se quiera al que se quiera. |
+| **Crossfade** | **1**, el que entra | El nuevo pasa de no sonar a sonar mientras el que estaba sonando va a su volumen objetivo. |
+| **Disparo único** | **1**, el que suena de golpe | Entra de golpe, sin fade, **una sola vez**. Para una explosión, un rayo o un portazo. Se monta **encima** de lo que ya suene. |
+| **Fade out** | **ninguno** | Baja **el audio que se está reproduciendo** en ese momento. No hay que buscarlo en la lista. |
+
+### El audio de base no se elige
+
+En el crossfade, el audio que sale **no se elige ni se puede modificar**, ni su
+identidad ni su volumen inicial: es el que está sonando en el instante en que se
+lanza el evento, y arranca la rampa **desde donde esté**. Del lado que sale lo
+único configurable es el **volumen objetivo** (`salidaPct`).
+
+Lo mismo en el fade out: no lleva audio. Es la forma de quitarse de encima una
+música sin buscarla en la lista.
+
+Los dos actúan sobre **todas** las pistas que estén sonando.
+
+### Parámetros
+
+- **Duración en milisegundos**: es la rampa entera, y es **el número que se
+  mueve para acortar o alargar una escena**. Es **una sola** para los dos lados
+  del crossfade: es lo que lo hace un crossfade y no dos fades seguidos.
+- **Volumen objetivo de lo que sale** (`salidaPct`): si es `0`, la pista se
+  apaga y **se corta** al terminar; si no, se queda sonando a ese volumen (una
+  música que baja al 25 % y se queda de fondo).
+- **Bucle**: `-1` = infinito (**predeterminado**), `0`/`1` = una vez, `N` = N
+  veces. Aplica al audio que entra, así que no se le pregunta a un fade out ni a
+  un disparo único.
+- Por audio que entra: **Desde ___ %**, **Hasta ___ %** y su propio volumen.
+- Curva, nota, tecla y pad.
+
+### Edición sobre la marcha
+
+- Botones **− / +** en la fila del evento: mueven la duración un 10 %
+  (redondeado a 250 ms). **Funcionan también en modo Función**, que es el
+  requisito: acortar o ampliar una escena en plena función sin rehacer la
+  configuración. Sólo cambian ese número; audios, curva y bucle se quedan como
+  están.
+- Esos ajustes **no entran en el historial**: un Ctrl+Z accidental en función
+  sería peor que no poder deshacer.
+- Cambiar el tipo de un evento **conserva lo que ya estaba configurado**: de
+  fade in a crossfade se añade el hueco que falta sin perder el audio elegido.
+
+### Creación
+
+Asistente en **dos pasos**: primero el tipo (que decide si hay que elegir audio
+y qué rampa le toca) y después el audio que entra. Para un fade out el segundo
+paso lo dice claro y no pide nada. Se puede crear el evento sin audio y
+elegirlo luego desde el inspector.
+
+### Un evento no apaga nada por su cuenta
+
+Sólo toca lo que suena a través de `salidaPct`, que es explícito. Si además
+apagara cosas por su cuenta, lanzar un evento en medio de una función cortaría
+algo que nadie mandó cortar. Para cortar está PARAR TODO.
+
+### Crossfade sin duplicar el audio de base
+
+Como el que sale no se elige, el evento nunca arranca una segunda copia del
+audio que ya está sonando: le aplica la rampa a la pista que ya existe. Es lo
+que hace que el crossfade suene como un crossfade y no como dos audios
+pisándose.

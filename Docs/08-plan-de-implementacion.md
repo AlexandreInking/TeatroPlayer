@@ -709,6 +709,11 @@ cargo run -p teatroplayer --release
 > seleccionada. El slider de duración es **logarítmico** (0,1 s a 60 s): en escala lineal el tramo que
 > más se usa (0,1-5 s) queda en el 8 % del recorrido y no se puede ajustar fino. El dirty flag llega
 > con el hito SES (no hay sesión que guardar todavía).
+>
+> ⚠️ **Superado por T-EVT-007 (2026-09-22).** Las 5 pestañas ya no existen: el
+> panel es 420 px y es **una columna con scroll y secciones con icono**. Este
+> bloque se deja como estaba porque es el registro de lo que se hizo entonces;
+> el estado actual del inspector está en el hito EVT y en `Docs/06` §4.
 
 ### T-UI-004 — Modo Diseño: operaciones de lista
 **Entregable:** agregar audio, reordenar (↑↓), renombrar, eliminar.
@@ -1217,6 +1222,225 @@ ls -lh target/release/teatroplayer.exe
 
 ---
 
+## Hito EVT — Eventos predefinidos y panel derecho
+
+Un **audio** es un archivo; un **evento** es una escena montada con uno o dos
+de esos audios. La spec funcional está en `Docs/05` FR-17 y el formato en
+`Docs/04` §5. Este hito existe porque el usuario lo pidió con estas palabras:
+"una lista de eventos predefinidos, guardables y reutilizables… editables sobre
+la marcha para acortar o ampliar escenas sin rehacer la configuración".
+
+### T-EVT-001 — Modelo de evento y persistencia (v2 → v3)
+**Entregable:** `src/eventos.rs` con `TipoEvento` (fadeIn / fadeOut / crossfade / golpe), `PistaEvento` y `Evento`; `Sesion.eventos` con `#[serde(default)]`; `VERSION` + cadena de migraciones.
+**Prueba:** round-trip por JSON; una sesión v1 sin la clave `eventos` se abre y se migra; un evento escrito a mano se abre igual; la v2 convierte los eventos al modelo sin audio de salida.
+**Criterio:** verde.
+
+> **Estado: ✅ HECHO (2026-09-22).** `bucle: i32` con `BUCLE_INFINITO = -1` como
+> pedía el usuario; `loop_mode()` traduce `-1→Infinite`, `0|1→None`, `n≥2→Count(n)`.
+>
+> El bump a la v2 **no convierte nada** (todos los campos nuevos son
+> `#[serde(default)]`) y aun así es deliberado: si una build vieja abre una
+> sesión v2, la abre **en sólo lectura** en vez de guardarla por encima
+> borrando los eventos sin avisar.
+>
+> **Corrección posterior (misma fecha):** la v2 guardaba el crossfade con dos
+> audios, pero el usuario aclaró que **el que sale no se elige** — es el que
+> está sonando. Se subió a **v3**: `pistas` pasa a tener como mucho un elemento
+> y el volumen objetivo del que sale se guarda en `salidaPct`. La migración
+> `migrar_v2_a_v3` **sí convierte**: conserva el que entra y traslada el
+> `hastaPct` del que salía. Sin convertir, el audio que salía se leería como el
+> que entra y el evento sonaría al revés.
+>
+> 17 tests unitarios + 8 de integración en `tests/eventos.rs`.
+
+### T-EVT-002 — Extremos del fade en porcentaje
+**Entregable:** `Entrance::FadeIn { from_percent, to_percent }` (con `#[serde(default)]`), aplicado en `LiveGain::with_entrance` como fracción del techo.
+**Prueba:** un fade 20→60 % da esos extremos; una sesión antigua sin los campos abre como 0→100.
+**Criterio:** verde.
+
+> **Estado: ✅ HECHO (2026-09-22).** Es lo que el usuario pidió: "elegir la
+> transición de fade con volumen de inicio y fin en porcentajes personalizados
+> (no solo 0% y 100%)".
+>
+> El volumen de la pista se sigue aplicando **antes** de la envolvente, así que
+> los porcentajes no alteran la forma de la curva.
+>
+> La interfaz dibuja la rampa con la **curva real** (`forma_de_curva`, ahora
+> pública): si dibujara una recta cuando la curva es exponencial, el panel
+> estaría mintiendo.
+
+### T-EVT-003 — Corte automático de la pista
+**Entregable:** `CueSpec.stop_after` (`stopAfterMs`) aplicado como `Source::take_duration` en la cadena de audio.
+**Prueba:** se serializa en ms, puede no estar, y una sesión sin el campo abre con `None`.
+**Criterio:** verde.
+
+> **Estado: ✅ HECHO (2026-09-22).** Lo pone `Evento::spec_para` cuando la rampa
+> acaba en silencio (`hasta_pct == 0`): sin esto la pista seguiría sonando en
+> silencio hasta el final del archivo, ocupando una pista del mezclador para
+> nada. El corte va en la cadena de audio, no en un temporizador: cae en una
+> muestra exacta, es determinista y no depende de que la UI esté repintando.
+
+### T-EVT-004 — Segunda lista y asistente de creación
+**Entregable:** pestañas *Audios* / *Eventos* en el panel central; asistente de dos pasos (tipo → audios).
+**Prueba:** comprobación visual + `cada_tipo_de_evento_tiene_su_icono`.
+**Criterio:** verde.
+
+> **Estado: ✅ HECHO (2026-09-22).** El usuario pidió "agregar una segunda lista
+> donde, en lugar de audios, se permita crear estos eventos". El asistente
+> pregunta **primero el tipo** porque eso decide cuántos audios hacen falta y
+> qué rampa le toca a cada uno.
+
+### T-EVT-005 — Edición sobre la marcha
+**Entregable:** botones − / + de duración en la fila del evento (10 %, redondeado a 250 ms) y editor completo en el inspector.
+**Prueba:** `el_paso_de_duracion_se_adapta_a_la_escena`; `alargar_la_escena_no_toca_nada_mas_del_evento`.
+**Criterio:** verde.
+
+> **Estado: ✅ HECHO (2026-09-22).** Los ± funcionan **también en modo Función**,
+> que era el requisito explícito, y **no entran en el historial**: un Ctrl+Z
+> accidental en plena función sería peor que no poder deshacer.
+>
+> Cambiar el tipo de un evento conserva lo ya configurado (`reajustar_huecos`):
+> de fade in a crossfade se añade el hueco que falta sin perder el audio
+> elegido.
+
+### T-EVT-006 — Lanzar un evento
+**Entregable:** `ir_evento()`: construye los `CueSpec` de cada hueco y los suena; relanzar reinicia en vez de duplicar.
+**Prueba:** `el_crossfade_baja_uno_y_sube_el_otro_en_el_mismo_tiempo`, `el_disparo_unico_entra_de_golpe_y_solo_una_vez`.
+**Criterio:** verde.
+
+> **Estado: ✅ HECHO (2026-09-22).** El **disparo único** (`tipo = golpe`) entra
+> de golpe, sin fade, una sola vez, y se monta **encima** de lo que suene: es
+> el efecto puntual que el usuario pidió (explosión, rayo).
+>
+> **Corrección posterior (misma fecha):** el lado que sale no arranca ninguna
+> pista propia. `bajar_lo_que_suena()` recorre **lo que está sonando** y le
+> aplica la rampa hacia `salidaPct`; si el objetivo es 0, usa `stop_after` para
+> que se apague y se corte. Así el crossfade nunca duplica el audio de base y el
+> fade out no necesita saber qué suena.
+>
+> Sólo fade in, crossfade y disparo único arrancan audio propio
+> (`spec_entrada()`); un fade out no tiene `spec_entrada()`.
+>
+> Un evento **no** apaga lo que suena por su cuenta (`onPrevious` queda en
+> `Keep`): de eso se encarga `salidaPct`, que es explícito.
+
+### T-EVT-007 — Rediseño del panel derecho y arranque limpio
+**Entregable:** inspector como columna con scroll y secciones con icono (sin pestañas); pads y teclas F compartidos entre audios y eventos; guarda contra el clic que llega en vuelo al abrir la ventana.
+**Prueba:** `el_clic_que_venia_en_vuelo_no_es_fiable`.
+**Criterio:** verde.
+
+> **Estado: ✅ HECHO (2026-09-22).** Las pestañas del inspector se probaron dos
+> veces y las dos veces hubo que adivinar en cuál vivía el control buscado; una
+> columna con secciones resuelve eso de raíz.
+>
+> `App::clic_fiable()` descarta el clic cuya **pulsación** empezó antes de que
+> la ventana existiera. Se midió con un diagnóstico y una captura de pantalla:
+> el caso real era un clic del usuario en otra ventana que aterrizaba en la
+> nuestra al aparecer debajo del cursor. La guarda cubre todo botón que suena,
+> borra o crea.
+
+---
+
+## Hito PUB — Publicar de verdad (0.3.0)
+
+El hito REL dejó el guion escrito y los scripts listos, pero **nunca se publicó
+nada**: no hay tag, no hay remoto y el instalador no se había compilado nunca
+(faltaba NSIS). Este hito cierra esa distancia: los tres artefactos existen y
+están verificados, y queda identificado lo que no depende de código.
+
+### T-PUB-001 — NSIS sin permisos de administrador
+**Entregable:** `scripts/nsis.ps1` con `Buscar-Makensis`; `instalador.ps1` y `publicar.ps1` lo usan.
+**Prueba:** compilar el instalador con NSIS 3.10 portable.
+**Criterio:** verde.
+
+> **Estado: ✅ HECHO (2026-09-22).** `winget install NSIS.NSIS` necesita
+> elevación y devuelve `0x800704c7`; el ZIP de nsis.sourceforge.io se
+> descomprime en cualquier carpeta y funciona igual. La búsqueda pasa a ser
+> `%NSIS_DIR%` → PATH → carpetas de la instalación normal, en un solo sitio en
+> vez de duplicada en los dos scripts.
+>
+> Resultado: `TeatroPlayer-Instalador.exe`, **2,83 MB** (el presupuesto de
+> `Docs/01` son 8 MB).
+
+### T-PUB-002 — El `.nsi` compila desde cualquier sitio
+**Entregable:** rutas del `.nsi` colgando de `${RAIZ}`, con `/DRAIZ=…` desde los scripts.
+**Prueba:** compilar desde la raíz del repositorio y desde fuera.
+**Criterio:** verde.
+
+> **Estado: ✅ HECHO (2026-09-22).** **NSIS une las rutas relativas con la
+> carpeta del script**, no con el directorio de invocación. Costó dos intentos:
+> `LICENSE` a secas se buscaba en `installer\LICENSE`, y `${__FILEDIR__}\..`
+> acababa en `installer\installer\..`. La solución es `${RAIZ}` = `..` por
+> defecto (que ya resuelve bien al unirse con `installer\`) y `/DRAIZ` con la
+> ruta absoluta desde los scripts.
+
+### T-PUB-003 — El instalador cumple la GPL
+**Entregable:** `LICENSE` y `THIRD-PARTY.html` copiados a la carpeta de instalación.
+**Prueba:** inspeccionar el contenido del instalador.
+**Criterio:** verde.
+
+> **Estado: ✅ HECHO (2026-09-22).** Antes sólo se **enseñaban** en una página
+> del asistente, que no es lo mismo que entregarlos: la GPL-3.0 obliga a que el
+> texto de la licencia viaje con el binario, y `THIRD-PARTY.html` es obligación
+> de las licencias de las dependencias (`Docs/11` §5). Ahora se copian como
+> `LICENSE.txt` y `TERCEROS.html`, con un acceso directo a ellos en el menú de
+> inicio.
+>
+> Mismo agujero en el ZIP portable, que llevaba `LICENSE` pero no el aviso de
+> terceros. `tools/portable_zip.py` ahora **falla** si falta cualquiera de los
+> dos: un ZIP que "casi" cumple es un ZIP que incumple.
+
+### T-PUB-004 — Desinstalación limpia
+**Entregable:** el desinstalador borra también `state.json` y `logs\`.
+**Prueba:** revisar qué escribe la app junto al ejecutable.
+**Criterio:** verde.
+
+> **Estado: ✅ HECHO (2026-09-22).** La app guarda el estado y los logs **junto
+> al ejecutable** (`Estado::ruta()` y `diagnostico::carpeta_logs()`), así que
+> tras usarla `$INSTDIR` no está vacío y el `RMDir "$INSTDIR"` del
+> desinstalador fallaba en silencio: quedaban restos, justo lo que `Docs/14` §6
+> pide que no pase. Ahora se borran esos dos y sólo se quita la carpeta si
+> quedó vacía, para no llevarse por delante nada que el usuario haya puesto ahí.
+
+### T-PUB-005 — Los tres artefactos, verificados
+**Entregable:** ejecutable, instalador y ZIP portable generados y comprobados.
+**Prueba:** `tools/verificar_release.py`, `cargo deny check`, `cargo about`.
+**Criterio:** verde.
+
+> **Estado: ✅ HECHO (2026-09-22).**
+>
+> | Artefacto | Tamaño | Comprobado |
+> |---|---|---|
+> | `teatroplayer.exe` | 7,7 MB | subsistema GUI (sin consola), logs OK |
+> | `TeatroPlayer-Instalador.exe` | 2,83 MB | compila; licencia y terceros dentro |
+> | `TeatroPlayer-portable.zip` | 3,4 MB | ejecutable, LEEME, licencia y terceros |
+>
+> `cargo deny check`: advisories, bans, licencias y fuentes en verde.
+
+### T-PUB-006 — Lo que no es código
+**Entregable:** dejar por escrito qué falta para poder publicar.
+**Prueba:** —
+**Criterio:** documentado.
+
+> **Estado: ⏳ ABIERTO.** Tres cosas, ninguna técnica:
+>
+> 1. **El repositorio no tiene remoto.** `git remote -v` sale vacío y los cuatro
+>    enlaces de winget llevan el marcador `USUARIO`. Sin una URL real no hay
+>    dónde subir el release.
+> 2. **El presupuesto de RAM (riesgo R16).** `Docs/01` §7 promete < 60 MB y la
+>    app usa ~140 MB, con una ventana egui vacía ya en 139,9 MB. Decisión:
+>    subir el presupuesto con la razón documentada, probar el backend `wgpu`, o
+>    cambiar de toolkit.
+> 3. **La firma de código (riesgo R9).** Sin certificado, SmartScreen avisa. Se
+>    puede publicar documentando el "Más información → Ejecutar de todas
+>    formas", pero para una 1.0 conviene resolverlo.
+>
+> Y las comprobaciones que exigen instalar de verdad (instalar sin
+> administrador, desinstalar sin restos, doble clic en un `.tpshow`, ZIP
+> portable en otra máquina) están en `Docs/14` §6.
+
+---
+
 ## Reglas de oro del plan
 
 1. **Ningún task se cierra sin su prueba verde.** "Funciona en mi máquina" no es cierre.
@@ -1238,6 +1462,8 @@ T-UI-006..010     (semana 7)
 T-SHOW-001..006   (semana 8)
 T-OPS-001..005    (semana 9)
 T-REL-001..006    (semana 10)
+T-EVT-001..007    (posterior, 0.2.0)   ← eventos predefinidos y panel derecho
+T-PUB-001..006    (posterior, 0.3.0)   ← publicar de verdad: instalador y artefactos
 ```
 
 Beta con un teatro real al final de la semana 10.

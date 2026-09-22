@@ -1,11 +1,11 @@
 PackageIdentifier: TeatroPlayer.TeatroPlayer
-PackageVersion: 0.1.0
+PackageVersion: 0.3.0
 PackageLocale: es-ES
 Publisher: TeatroPlayer
 PackageName: TeatroPlayer
-PackageUrl: https://github.com/USUARIO/TeatroPlayer
+PackageUrl: https://github.com/AlexandreInking/TeatroPlayer
 License: GPL-3.0-or-later
-LicenseUrl: https://github.com/USUARIO/TeatroPlayer/blob/main/LICENSE
+LicenseUrl: https://github.com/AlexandreInking/TeatroPlayer/blob/main/LICENSE
 ShortDescription: Reproductor de audio para teatro con fades y crossfades en tiempo real
 Description: >-
   Reproductor de audio para teatro. Carga una carpeta de audios, configura cómo
@@ -21,6 +21,6 @@ Tags:
   - teatroplayer
 Documentations:
   - DocumentLabel: Documentación del proyecto
-    DocumentUrl: https://github.com/USUARIO/TeatroPlayer/tree/main/Docs
+    DocumentUrl: https://github.com/AlexandreInking/TeatroPlayer/tree/main/Docs
 ManifestType: locale
 ManifestVersion: 1.9.0

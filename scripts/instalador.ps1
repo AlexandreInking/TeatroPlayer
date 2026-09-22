@@ -26,24 +26,21 @@ if (-not (Test-Path "LICENSE")) {
 }
 
 # --- buscar makensis -------------------------------------------------------
-$makensis = Get-Command makensis -ErrorAction SilentlyContinue |
-    Select-Object -ExpandProperty Source
-
-if (-not $makensis) {
-    foreach ($candidato in @(
-        "C:\Program Files (x86)\NSIS\makensis.exe",
-        "C:\Program Files\NSIS\makensis.exe"
-    )) {
-        if (Test-Path $candidato) { $makensis = $candidato; break }
-    }
-}
+. "$PSScriptRoot\nsis.ps1"
+$makensis = Buscar-Makensis
 
 if (-not $makensis) {
     Write-Host "No se encuentra NSIS."
     Write-Host ""
-    Write-Host "Para compilar el instalador hace falta NSIS 3:"
-    Write-Host "  winget install NSIS.NSIS"
-    Write-Host "  o  https://nsis.sourceforge.io/Download"
+    Write-Host "Para compilar el instalador hace falta NSIS 3. Dos formas:"
+    Write-Host ""
+    Write-Host "  Con administrador:"
+    Write-Host "    winget install NSIS.NSIS"
+    Write-Host ""
+    Write-Host "  Sin administrador (portable):"
+    Write-Host "    1. Descarga https://nsis.sourceforge.io/Download (nsis-3.x.zip)"
+    Write-Host "    2. Descomprimelo donde quieras"
+    Write-Host "    3. setx NSIS_DIR ""C:\ruta\a\nsis-3.x"""
     Write-Host ""
     Write-Host "El script del instalador está escrito y revisado en"
     Write-Host "installer\teatroplayer.nsi; sólo falta la herramienta."
@@ -52,7 +49,10 @@ if (-not $makensis) {
 }
 
 Write-Host "makensis : $makensis"
-& $makensis "installer\teatroplayer.nsi"
+# `/DRAIZ` con la ruta absoluta: NSIS une las rutas relativas con la carpeta
+# del script, así que sin esto el `.nsi` depende de que la estructura de
+# carpetas sea exactamente la del repositorio.
+& $makensis "/DRAIZ=$raiz" "installer\teatroplayer.nsi"
 if ($LASTEXITCODE -ne 0) { Pop-Location; exit $LASTEXITCODE }
 
 $salida = "target\release\TeatroPlayer-Instalador.exe"

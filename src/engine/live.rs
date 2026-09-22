@@ -133,10 +133,13 @@ where
         let sample_rate = inner.sample_rate().get();
         let channels = inner.channels().get();
 
+        // `start_gain` es el techo (1.0 en la app): los porcentajes son
+        // fracciones de ese techo, así que el volumen de la pista sigue yendo
+        // antes de la envolvente y no altera la forma de la rampa.
         let ramp = match entrance {
-            Some(Entrance::FadeIn { duration, curve }) => Ramp {
-                from: 0.0,
-                to: start_gain,
+            Some(Entrance::FadeIn { duration, curve, from_percent, to_percent }) => Ramp {
+                from: start_gain * (from_percent as f32 / 100.0),
+                to: start_gain * (to_percent as f32 / 100.0),
                 start_frame: 0,
                 ramp_frames: duration_to_frames(duration, sample_rate),
                 curve,
@@ -330,7 +333,12 @@ mod tests {
         let (mut g, _c) = LiveGain::with_entrance(
             mono(48_000),
             1.0,
-            Some(Entrance::FadeIn { duration: Duration::from_secs(1), curve: Curve::EqualPower }),
+            Some(Entrance::FadeIn {
+                duration: Duration::from_secs(1),
+                curve: Curve::EqualPower,
+                from_percent: 0,
+                to_percent: 100,
+            }),
         );
         let s: Vec<f32> = g.by_ref().take(10).collect();
         assert!(s[0].abs() < 1e-6, "x[0] = {}", s[0]);

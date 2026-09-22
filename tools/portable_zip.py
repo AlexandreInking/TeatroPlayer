@@ -6,11 +6,17 @@ sin instalar nada. Para que eso sea cierto, el ZIP tiene que llevar **todo lo
 que el ejecutable necesita y nada que dependa de esta máquina**:
 
   teatroplayer.exe   el binario
-  portable.txt       marca: si existe, la app no escribe fuera de su carpeta
+  portable.txt       marca para el humano: "esta copia es la portable"
   LEEME.txt          cómo se usa
   LICENSE            la GPL-3.0, que hay que repartir junto al binario
 
 No incluye `logs/` ni `state.json`: los crea la app al arrancar.
+
+`portable.txt` **no cambia el comportamiento del programa**, y conviene no
+prometer lo contrario: la app es portable por diseño y escribe siempre junto al
+ejecutable (`Estado::ruta()` y `diagnostico::carpeta_logs()`), nunca en
+`%APPDATA%` ni en el registro. Por eso el ZIP funciona sin instalar nada. El
+archivo queda como señal para quien abre la carpeta, no como interruptor.
 
 Uso:
     python tools/portable_zip.py [salida.zip]
@@ -43,11 +49,18 @@ LICENSE.
 """
 
 PORTABLE = """\
-Este archivo le dice a TeatroPlayer que está corriendo en modo portable:
-no escribirá nada fuera de esta carpeta.
+Esta es la versión portable de TeatroPlayer.
 
-Borrar este archivo NO rompe el programa, pero sí hace que empiece a guardar
-su estado junto al ejecutable en la carpeta de instalación en vez de aquí.
+TeatroPlayer no se instala y no escribe nada fuera de su propia carpeta: los
+logs y el recuerdo de la última obra se guardan aquí al lado. Puedes copiar
+esta carpeta a un pendrive, llevarla a otro equipo y borrarla entera para no
+dejar rastro.
+
+Este archivo es sólo una señal de que estás ante la copia portable. Borrarlo no
+cambia nada del comportamiento del programa.
+
+Si quieres que los archivos .tpshow se abran con doble clic, usa el instalador
+en vez de esta versión: es lo único que registra la asociación.
 """
 
 
@@ -60,18 +73,26 @@ def main():
         print(f"FALLO: no existe {exe}. Haz `cargo build --release` primero.")
         return 1
 
-    licencia = os.path.join(RAIZ, "LICENSE")
-    if not os.path.isfile(licencia):
-        print("AVISO: no hay LICENSE en la raíz; el ZIP saldrá sin ella.")
-        licencia = None
+    # Los dos avisos legales van SIEMPRE, y si falta alguno el ZIP no sale.
+    # Repartir el binario sin ellos incumple la GPL-3.0 (el texto de la
+    # licencia tiene que viajar con el programa) y las licencias de las
+    # dependencias, que es lo que recoge `THIRD-PARTY.html` (`Docs/11` §5).
+    # Un ZIP que "casi" cumple es un ZIP que incumple, así que aquí se para.
+    legales = [("LICENSE", "LICENSE"), ("THIRD-PARTY.html", "TERCEROS.html")]
+    for origen, destino in legales:
+        if not os.path.isfile(os.path.join(RAIZ, origen)):
+            print(f"FALLO: falta {origen} en la raíz del repositorio.")
+            if origen == "THIRD-PARTY.html":
+                print("       Generalo con: cargo about generate about.hbs -o THIRD-PARTY.html")
+            return 1
 
     print(f"generando {salida}")
     with zipfile.ZipFile(salida, "w", zipfile.ZIP_DEFLATED) as z:
         z.write(exe, "TeatroPlayer.exe")
         z.writestr("portable.txt", PORTABLE)
         z.writestr("LEEME.txt", LEEME)
-        if licencia:
-            z.write(licencia, "LICENSE")
+        for origen, destino in legales:
+            z.write(os.path.join(RAIZ, origen), destino)
 
     tamaño = os.path.getsize(salida) / (1024 * 1024)
     print(f"  {tamaño:.1f} MB")
