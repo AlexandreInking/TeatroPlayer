@@ -39,7 +39,12 @@
 !endif
 
 Name "TeatroPlayer"
-OutFile "${RAIZ}\target\release\TeatroPlayer-Instalador.exe"
+; El instalador sale a `dist\` (en `.gitignore`), no a `target\`: `cargo clean`
+; borra `target\` entero y se llevaría por delante el instalador ya compilado.
+; **`dist\` tiene que existir antes de invocar a makensis**: NSIS no crea la
+; carpeta de `OutFile` y falla con un "Can't open output file" que no explica
+; nada. La crean `scripts\instalador.ps1` y `scripts\publicar.ps1`.
+OutFile "${RAIZ}\dist\TeatroPlayer-Instalador.exe"
 InstallDir "$LOCALAPPDATA\Programs\TeatroPlayer"
 InstallDirRegKey HKCU "Software\TeatroPlayer" "InstallDir"
 RequestExecutionLevel user          ; <- sin administrador, a propósito

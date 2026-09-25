@@ -18,7 +18,7 @@
 //! La duración se guarda en **nanosegundos**, no en frames, porque quien pide
 //! el fade no conoce el sample rate del audio; lo traduce el source, que sí.
 
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -39,6 +39,14 @@ struct Shared {
     curve: AtomicU8,
     /// Última ganancia aplicada. Solo informativo, para la UI.
     last_gain: AtomicU32,
+    /// La rampa en curso ya llegó a su final.
+    ///
+    /// Lo escribe el hilo de audio y lo leen los temporizadores de "fade out y
+    /// corta". Es la pieza que hace que una pausa **en medio de un fade** lo
+    /// congele de verdad: el flag se mueve con los frames consumidos, no con el
+    /// reloj de pared, así que si la pista está en pausa el fade no avanza y
+    /// nadie la corta por debajo.
+    ramp_done: AtomicBool,
 }
 
 /// Rampa vigente, ya traducida a frames.
@@ -81,14 +89,26 @@ impl EnvelopeControl {
     }
 
     /// Rampa hasta `gain` en `duration`. Si `duration` es 0, es inmediato.
+    ///
+    /// Los tres parámetros se escriben con `Relaxed` y el `seq` con `Release`:
+    /// el `Release` garantiza que todo lo escrito antes es visible para quien
+    /// lea el `seq` con `Acquire`. Encadenar `SeqCst` en los cuatro sería
+    /// correcto pero metería tres barreras de más en cada GO, y esto lo llama
+    /// la UI en cada fade.
     pub fn fade_to(&self, gain: f32, duration: Duration, curve: Curve) {
         let gain = gain.clamp(0.0, 1.0);
-        self.shared.to.store(gain.to_bits(), Ordering::SeqCst);
-        self.shared.ramp_ns.store(duration.as_nanos() as u64, Ordering::SeqCst);
-        self.shared.curve.store(curve.to_u8(), Ordering::SeqCst);
-        // El incremento va al final: el lector que vea el `seq` nuevo ya verá
-        // los parámetros nuevos (todo SeqCst).
-        self.shared.seq.fetch_add(1, Ordering::SeqCst);
+        self.shared.to.store(gain.to_bits(), Ordering::Relaxed);
+        self.shared.ramp_ns.store(duration.as_nanos() as u64, Ordering::Relaxed);
+        self.shared.curve.store(curve.to_u8(), Ordering::Relaxed);
+        // El flag se publica **antes** del `seq`. Si no, quien preguntara
+        // "¿terminó ya?" entre este momento y la primera muestra leería el
+        // valor de la rampa anterior y cortaría la pista sin haber hecho el
+        // fade: es el caso de pedir un fade out sobre una pista que ya estaba
+        // a pleno volumen (rampa previa de duración 0 → terminada).
+        self.shared.ramp_done.store(duration <= Duration::ZERO, Ordering::Relaxed);
+        // El incremento va al final y con `Release`: el lector que vea el `seq`
+        // nuevo ya verá los parámetros nuevos.
+        self.shared.seq.fetch_add(1, Ordering::Release);
     }
 
     /// Fade out total.
@@ -99,6 +119,17 @@ impl EnvelopeControl {
     /// Última ganancia aplicada. Aproximada: puede ir un frame por detrás.
     pub fn gain(&self) -> f32 {
         f32::from_bits(self.shared.last_gain.load(Ordering::Relaxed))
+    }
+
+    /// true si la rampa que se pidió ya se ha recorrido entera.
+    ///
+    /// Se mide en **frames consumidos**, no con el reloj de pared: una pista en
+    /// pausa no consume frames, así que un fade out a medias sigue a medias
+    /// aunque pasen minutos. Es lo que permite cortar la pista justo cuando la
+    /// ganancia llega a cero sin depender de un temporizador que siga corriendo
+    /// mientras la sala está en pausa.
+    pub fn rampa_terminada(&self) -> bool {
+        self.shared.ramp_done.load(Ordering::Acquire)
     }
 }
 
@@ -112,6 +143,13 @@ pub struct LiveGain<S> {
     shared: Arc<Shared>,
     ramp: Ramp,
     seq: u64,
+    /// Última ganancia calculada y para qué frame. Dentro de un mismo frame la
+    /// ganancia no cambia (solo depende del índice de frame), así que en
+    /// estéreo se calcula una vez y se reutiliza para el segundo canal.
+    frame_cache: (u64, f32),
+    /// Último valor publicado de `Shared::ramp_done`, para no escribir el
+    /// atómico en cada muestra: sólo cuando cambia.
+    done: bool,
 }
 
 impl<S> LiveGain<S>
@@ -147,12 +185,17 @@ where
             _ => Ramp { from: start_gain, to: start_gain, ..Ramp::unity() },
         };
 
+        // Sin rampa (o con una de duración 0) la envolvente ya está "terminada"
+        // desde el principio: así un corte pedido sin fade corta ya.
+        let done_inicial = ramp.ramp_frames == 0;
+
         let shared = Arc::new(Shared {
             seq: AtomicU64::new(0),
             to: AtomicU32::new(ramp.to.to_bits()),
             ramp_ns: AtomicU64::new(0),
             curve: AtomicU8::new(Curve::Linear.to_u8()),
             last_gain: AtomicU32::new(ramp.from.to_bits()),
+            ramp_done: AtomicBool::new(done_inicial),
         });
 
         let this = Self {
@@ -163,6 +206,8 @@ where
             shared: Arc::clone(&shared),
             ramp,
             seq: 0,
+            frame_cache: (0, ramp.from),
+            done: done_inicial,
         };
         (this, EnvelopeControl { shared })
     }
@@ -179,19 +224,61 @@ where
 
     /// Ganancia que corresponde al frame dado, actualizando la rampa si la UI
     /// publicó una nueva.
+    ///
+    /// Esto corre **una vez por muestra** en el hilo de audio, así que todo lo
+    /// que se pueda sacar de aquí, se saca:
+    ///
+    ///   * El `seq` se lee con `Acquire`/`Relaxed`, no `SeqCst`. Basta con que
+    ///     el lector vea los parámetros *antes* que el `seq`: eso es
+    ///     exactamente lo que da `Release` al escribir y `Acquire` al leer, y
+    ///     evita la barrera completa (que en x86 es un `lock` real) en cada
+    ///     muestra. La corrección no cambia.
+    ///   * La ganancia **solo se recalcula cuando cambia de frame**. Un frame
+    ///     son `channels` muestras (2 en estéreo), y dentro del mismo frame la
+    ///     ganancia es idéntica por construcción (depende solo del índice de
+    ///     frame). Se ahorra la mitad de los cálculos de curva en estéreo.
     fn gain_at(&mut self, frame: u64) -> f32 {
-        let seq = self.shared.seq.load(Ordering::SeqCst);
+        let seq = self.shared.seq.load(Ordering::Acquire);
         if seq != self.seq {
             self.seq = seq;
-            let to = f32::from_bits(self.shared.to.load(Ordering::SeqCst));
-            let ns = self.shared.ramp_ns.load(Ordering::SeqCst);
-            let curve = Curve::from_u8(self.shared.curve.load(Ordering::SeqCst));
+            // Los tres parámetros se escriben antes del `seq` (Release al
+            // publicar), así que aquí ya están visibles.
+            let to = f32::from_bits(self.shared.to.load(Ordering::Relaxed));
+            let ns = self.shared.ramp_ns.load(Ordering::Relaxed);
+            let curve = Curve::from_u8(self.shared.curve.load(Ordering::Relaxed));
             let ramp_frames = duration_to_frames(Duration::from_nanos(ns), self.sample_rate);
             // Arrancar desde la ganancia actual es lo que evita el clic.
             let from = self.ramp.gain_at(frame);
             self.ramp = Ramp { from, to, start_frame: frame, ramp_frames, curve };
+            self.frame_cache = (frame, self.ramp.gain_at(frame));
+            // Acaba de nacer una rampa: la anterior ya no cuenta como terminada.
+            // Si no tiene duración (cambio de golpe), lo está desde ya.
+            let done = ramp_frames == 0;
+            if done != self.done {
+                self.done = done;
+                self.shared.ramp_done.store(done, Ordering::Release);
+            }
         }
-        let gain = self.ramp.gain_at(frame);
+
+        // Mismo frame que la última vez: la ganancia no ha cambiado. En
+        // estéreo esto evita calcular la curva para el canal derecho.
+        let gain = if self.frame_cache.0 == frame {
+            self.frame_cache.1
+        } else {
+            let g = self.ramp.gain_at(frame);
+            self.frame_cache = (frame, g);
+            g
+        };
+
+        // ¿La rampa ya recorrió todo? Sólo se escribe cuando cambia: un
+        // `store` relajado por muestra en el camino caliente se nota.
+        let done = self.ramp.ramp_frames == 0
+            || frame >= self.ramp.start_frame + self.ramp.ramp_frames;
+        if done != self.done {
+            self.done = done;
+            self.shared.ramp_done.store(done, Ordering::Release);
+        }
+
         self.shared.last_gain.store(gain.to_bits(), Ordering::Relaxed);
         gain
     }
@@ -328,6 +415,55 @@ mod tests {
         );
     }
 
+    /// La optimización de la caché de frame **no puede cambiar ni una muestra**.
+    ///
+    /// `gain_at` cachea la ganancia del frame en curso para no recalcular la
+    /// curva en el segundo canal (estéreo). Ese atajo es correcto porque la
+    /// ganancia depende solo del índice de frame, pero es justo el tipo de
+    /// optimización que se rompe en silencio si alguien la toca sin entenderla:
+    /// se oiría un canal desfasado del otro y nadie se daría cuenta hasta el
+    /// estreno. Este test compara canal izquierdo y derecho muestra a muestra:
+    /// con una entrada constante, tras multiplicar por la misma ganancia, los
+    /// dos canales tienen que ser **exactamente iguales**, bit a bit.
+    #[test]
+    fn la_cache_de_frame_no_desfasa_los_canales() {
+        // 2 s de estéreo con fade de 1 s: toda la rampa queda dentro.
+        let src = Const { value: 0.75, left: 48_000 * 2 * 2, rate: 48_000, channels: 2 };
+        let (mut g, _c) = LiveGain::with_entrance(
+            src,
+            1.0,
+            Some(Entrance::FadeIn {
+                duration: Duration::from_secs(1),
+                curve: Curve::EqualPower,
+                from_percent: 0,
+                to_percent: 100,
+            }),
+        );
+
+        let muestras: Vec<f32> = g.by_ref().take(48_000 * 2 * 2).collect();
+        assert_eq!(muestras.len(), 48_000 * 2 * 2);
+
+        for (i, par) in muestras.as_chunks::<2>().0.iter().enumerate() {
+            assert_eq!(
+                par[0].to_bits(),
+                par[1].to_bits(),
+                "frame {i}: canal L y R difieren ({} vs {})",
+                par[0],
+                par[1]
+            );
+        }
+
+        // Y la rampa sigue estando: el primer frame está en silencio y a 1 s
+        // ya llegó al techo. Sin esto el test pasaría aunque la ganancia
+        // estuviera congelada en un valor constante.
+        assert!(muestras[0].abs() < 1e-6);
+        let a_un_segundo = muestras[48_000 * 2];
+        assert!(
+            (a_un_segundo - 0.75).abs() < 1e-4,
+            "a 1 s debería estar en el techo 0.75, vale {a_un_segundo}"
+        );
+    }
+
     #[test]
     fn la_entrada_con_fade_in_arranca_en_cero() {
         let (mut g, _c) = LiveGain::with_entrance(
@@ -358,6 +494,33 @@ mod tests {
         let (mut g, _c) = LiveGain::new(src, 1.0);
         let _ = g.by_ref().take(8).count();
         assert_eq!(g.frame(), 4, "con 2 canales, 8 muestras son 4 frames");
+    }
+
+    /// `rampa_terminada` se mueve con las muestras, no con el reloj.
+    ///
+    /// Es la pieza de la que depende "fade out y corta": si avanzara con el
+    /// reloj de pared, una pista en pausa se cortaría sola mientras el
+    /// operador sigue en silencio. Aquí se comprueba justo lo contrario: sin
+    /// consumir muestras, un fade de 1 s **no** termina nunca.
+    #[test]
+    fn la_rampa_no_termina_si_no_se_consumen_muestras() {
+        let (mut g, c) = LiveGain::new(mono(48_000 * 3), 1.0);
+        c.fade_out(Duration::from_secs(1), Curve::Linear);
+
+        // Sin muestras consumidas, la rampa está empezada: no puede estar
+        // terminada por mucho que pase el tiempo de verdad.
+        assert!(!c.rampa_terminada(), "recién pedida, no puede estar terminada");
+
+        // La rampa llega a cero justo en el frame 48.000, así que hacen falta
+        // 48.001 muestras para que ese frame se haya consumido.
+        let _ = g.by_ref().take(48_000 + 1).count();
+        assert!(c.rampa_terminada(), "tras 1 s de muestras debe estar terminada");
+    }
+
+    #[test]
+    fn un_cambio_de_golpe_esta_terminado_desde_el_principio() {
+        let (_g, c) = LiveGain::new(mono(100), 1.0);
+        assert!(c.rampa_terminada(), "sin rampa no hay nada que esperar");
     }
 
     #[test]

@@ -49,6 +49,9 @@ pub enum OutputSelection {
 pub enum TrackState {
     /// Sonando (o en el fade de entrada).
     Playing,
+    /// Congelada donde estaba. **No** es un estado final: al reanudar sigue
+    /// por la misma muestra, con el fade por la mitad si estaba a medias.
+    Paused,
     /// Bajando porque alguien pidió un fade out.
     FadingOut,
     /// Cortada antes de terminar.
@@ -92,7 +95,28 @@ pub trait TrackHandle: Send + Sync {
     /// Hace fade out y corta la pista al terminar.
     ///
     /// Es lo que hace el botón SALIR del modo Función.
+    ///
+    /// El corte cae **cuando la rampa se ha recorrido**, medido en muestras: si
+    /// la pista se pone en pausa a media bajada, se queda a media bajada y no
+    /// se corta sola por mucho que pase el reloj.
     fn stop_after(&self, fade: Duration, curve: Curve);
+
+    /// Congela la pista donde está.
+    ///
+    ///Es distinto de `stop`: la pista sigue montada, con su posición y su
+    /// envolvente intactas, y vuelve con `resume`. Vale igual para un loop que
+    /// para un efecto de una sola pasada.
+    fn pause(&self);
+
+    /// Sigue donde se quedó.
+    fn resume(&self);
+
+    fn is_paused(&self) -> bool;
+
+    /// Ganancia que se está aplicando ahora mismo (0.0–1.0), sin contar el
+    /// volumen de la pista. Sirve para que el operador **vea** el fade: si la
+    /// barra se mueve, el fade va; si salta de 0 a 1, no hay fade.
+    fn gain(&self) -> f32;
 
     /// Corte inmediato.
     fn stop(&self);
@@ -126,6 +150,12 @@ pub trait AudioBackend: Send + Sync {
 
     /// Para todas las pistas.
     fn stop_all(&self);
+
+    /// Congela todas las pistas vivas. Las que ya sonaban siguen montadas.
+    fn pause_all(&self);
+
+    /// Reanuda todas las pistas congeladas.
+    fn resume_all(&self);
 
     /// Limita el máster para que la mezcla nunca pase de 0 dBFS (T-ENG-004).
     fn set_master_limit(&self, enabled: bool);

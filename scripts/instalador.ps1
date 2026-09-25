@@ -49,13 +49,17 @@ if (-not $makensis) {
 }
 
 Write-Host "makensis : $makensis"
+# `dist\` tiene que existir antes de llamar a makensis: NSIS no crea la carpeta
+# de `OutFile` y falla con "Can't open output file", que no dice por qué. En un
+# clon recién hecho no está, porque `/dist/` va en `.gitignore`.
+New-Item -ItemType Directory -Force -Path "dist" | Out-Null
 # `/DRAIZ` con la ruta absoluta: NSIS une las rutas relativas con la carpeta
 # del script, así que sin esto el `.nsi` depende de que la estructura de
 # carpetas sea exactamente la del repositorio.
 & $makensis "/DRAIZ=$raiz" "installer\teatroplayer.nsi"
 if ($LASTEXITCODE -ne 0) { Pop-Location; exit $LASTEXITCODE }
 
-$salida = "target\release\TeatroPlayer-Instalador.exe"
+$salida = "dist\TeatroPlayer-Instalador.exe"
 if (Test-Path $salida) {
     $tam = (Get-Item $salida).Length
     Write-Host ""

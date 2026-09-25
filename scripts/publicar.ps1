@@ -82,11 +82,14 @@ $makensis = Buscar-Makensis
 
 if ($makensis) {
     Write-Host "[5/5] instalador NSIS..."
+    # NSIS no crea la carpeta de `OutFile`: si no existe, falla con un
+    # "Can't open output file" que no explica nada.
+    New-Item -ItemType Directory -Force -Path "dist" | Out-Null
     # /DRAIZ con la ruta absoluta: NSIS une las rutas relativas con la carpeta del
     # script, asi que sin esto el .nsi depende de la estructura de carpetas.
     & $makensis "/DRAIZ=$raiz" "installer\teatroplayer.nsi"
     if ($LASTEXITCODE -eq 0) {
-        $inst = "target\release\TeatroPlayer-Instalador.exe"
+        $inst = "dist\TeatroPlayer-Instalador.exe"
         if (Test-Path $inst) {
             $hash = (Get-FileHash $inst -Algorithm SHA256).Hash
             Write-Host ""
@@ -116,8 +119,8 @@ Write-Host "  2. crear el tag y subirlo:"
 Write-Host "       git tag -a v$Version -m 'TeatroPlayer $Version'"
 Write-Host "       git push origin v$Version"
 Write-Host "  3. crear el release en GitHub adjuntando:"
-Write-Host "       target\release\TeatroPlayer-Instalador.exe"
-Write-Host "       target\release\TeatroPlayer-portable.zip"
+Write-Host "       dist\TeatroPlayer-Instalador.exe"
+Write-Host "       dist\TeatroPlayer-portable.zip"
 Write-Host "       THIRD-PARTY.html"
 Write-Host "     y enlazando al tag (con eso cumples la obligacion de codigo fuente de la GPL-3.0)"
 Write-Host "  4. manifiesto winget en installer\winget\: rellenar InstallerUrl y InstallerSha256,"

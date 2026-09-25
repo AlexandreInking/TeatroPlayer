@@ -15,10 +15,29 @@ Hace, en orden:
 1. **Los tests.** Si alguno falla, se para: no se publica nada roto.
 2. **El ejecutable de release** (`target/release/teatroplayer.exe`).
 3. **El aviso de terceros** (`THIRD-PARTY.html`) con `cargo-about`. Obligación de la GPL-3.0.
-4. **El ZIP portable** (`TeatroPlayer-portable.zip`) con el exe, `portable.txt`, un `LEEME.txt` y la licencia.
-5. **El instalador NSIS**, si `makensis` está disponible, y el **SHA-256** del instalador (que es el `InstallerSha256` que pide winget).
+4. **El ZIP portable** (`dist/TeatroPlayer-portable.zip`) con el exe, `portable.txt`, un `LEEME.txt` y la licencia.
+5. **El instalador NSIS** (`dist/TeatroPlayer-Instalador.exe`), si `makensis` está disponible, y el **SHA-256** del instalador (que es el `InstallerSha256` que pide winget).
 
 Si NSIS no está instalado, lo dice y sigue con el resto.
+
+### Por qué los paquetes salen a `dist/` y no a `target/`
+
+Los dos artefactos que se reparten (instalador y ZIP portable) se escriben en
+`dist/`, que está en `.gitignore`. Antes salían a `target/release/`, y eso tenía
+dos problemas:
+
+- **`cargo clean` se los lleva.** `target/` es una carpeta de compilación y se
+  borra sin miramientos; un instalador recién compilado no debería vivir ahí.
+- **Se mezclan con 9 GB de objetos intermedios.** Encontrar «lo que hay que
+  subir al release» entre miles de `.o` y `.rlib` es incómodo.
+
+`dist/` está ignorado por git, así que **nada de lo que se genera entra al
+repositorio**: el release se publica en GitHub, no en el control de versiones.
+
+> **NSIS no crea la carpeta de `OutFile`.** Si `dist\` no existe, makensis falla
+> con un `Can't open output file` que no explica nada. Por eso
+> `scripts\instalador.ps1` y `scripts\publicar.ps1` hacen `New-Item -Force`
+> antes de llamarlo. Al invocar `makensis` a mano, crear `dist\` primero.
 
 ### NSIS sin permisos de administrador (recomendado)
 
@@ -83,12 +102,41 @@ git push origin v0.3.0
 
 ## 4. Crear el release
 
+### Con `gh` (necesita sesión)
+
+`gh` está instalado en este equipo pero **sin autenticar** (`gh auth status` lo
+dice), así que hay que entrar una vez:
+
+```
+gh auth login
+```
+
+Y después, desde la raíz del repositorio:
+
+```
+gh release create v0.3.0 ^
+  "dist\TeatroPlayer-Instalador.exe" ^
+  "dist\TeatroPlayer-portable.zip" ^
+  "THIRD-PARTY.html" ^
+  --title "TeatroPlayer 0.3.0" ^
+  --notes-file "installer\notas-release-0.3.0.md"
+```
+
+Las notas ya están escritas en `installer\notas-release-0.3.0.md`: se pueden
+editar antes de lanzarlo. **No hace falta reescribirlas.**
+
+> El `InstallerUrl` del manifiesto de winget apunta justo a
+> `releases/download/v0.3.0/TeatroPlayer-Instalador.exe`, así que **hasta que
+> exista el release esa URL no resuelve** y winget no puede validar el paquete.
+
+### A mano, en la web
+
 En GitHub, sobre el tag `v0.3.0`, adjuntando:
 
 | Archivo | Para qué |
 |---|---|
-| `target/release/TeatroPlayer-Instalador.exe` | instalación normal, por usuario y sin administrador |
-| `target/release/TeatroPlayer-portable.zip` | llevar en un pendrive, sin instalar |
+| `dist/TeatroPlayer-Instalador.exe` | instalación normal, por usuario y sin administrador |
+| `dist/TeatroPlayer-portable.zip` | llevar en un pendrive, sin instalar |
 | `THIRD-PARTY.html` | aviso de licencias de terceros |
 
 Y en el texto del release, un enlace al tag. **Con eso se cumple la obligación de código fuente de la GPL-3.0**: el binario y su fuente quedan publicados juntos.
@@ -179,7 +227,7 @@ relleno con el hash del instalador de la 0.3.0:
 volver a calcularlo y actualizarlo antes de abrir el PR de winget:
 
 ```
-(Get-FileHash target\release\TeatroPlayer-Instalador.exe -Algorithm SHA256).Hash
+(Get-FileHash dist\TeatroPlayer-Instalador.exe -Algorithm SHA256).Hash
 ```
 
 o copiarlo de lo que imprime `scripts\publicar.ps1`. Un hash que no cuadra hace
@@ -199,7 +247,8 @@ que winget rechace el paquete en la validación automática.
 | Qué | Cómo |
 |---|---|
 | Todo lo automatizable | `scripts\publicar.ps1` (con PowerShell) |
-| Solo el instalador | `powershell -File scripts\instalador.ps1` |
-| Solo el ZIP portable | `python tools\portable_zip.py` |
+| Solo el instalador | `powershell -File scripts\instalador.ps1` → `dist\` |
+| Solo el ZIP portable | `python tools\portable_zip.py` → `dist\` |
 | Verificar el ejecutable | `python tools\verificar_release.py` |
 | Build reproducible | `scripts\repro-build.ps1` |
+| Comparar el coste del fade | `cargo test --release --test perfil_ganancia -- --nocapture` |

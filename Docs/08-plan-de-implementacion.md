@@ -1422,22 +1422,81 @@ están verificados, y queda identificado lo que no depende de código.
 **Prueba:** —
 **Criterio:** documentado.
 
-> **Estado: ⏳ ABIERTO.** Tres cosas, ninguna técnica:
+> **Estado: ⏳ ABIERTO.** Dos cosas, ninguna técnica:
 >
-> 1. **El repositorio no tiene remoto.** `git remote -v` sale vacío y los cuatro
->    enlaces de winget llevan el marcador `USUARIO`. Sin una URL real no hay
->    dónde subir el release.
-> 2. **El presupuesto de RAM (riesgo R16).** `Docs/01` §7 promete < 60 MB y la
->    app usa ~140 MB, con una ventana egui vacía ya en 139,9 MB. Decisión:
->    subir el presupuesto con la razón documentada, probar el backend `wgpu`, o
->    cambiar de toolkit.
-> 3. **La firma de código (riesgo R9).** Sin certificado, SmartScreen avisa. Se
+> 1. **El presupuesto de RAM (riesgo R16): cerrado por decisión.** `Docs/01` §7
+>    promete < 60 MB y la app usa ~140 MB, con una ventana egui vacía ya en
+>    139,9 MB. Se subió el presupuesto a < 150 MB con la razón documentada (el
+>    coste es eframe + glow/OpenGL, no el motor de audio). Ver `Docs/09` R16.
+> 2. **La firma de código (riesgo R9).** Sin certificado, SmartScreen avisa. Se
 >    puede publicar documentando el "Más información → Ejecutar de todas
 >    formas", pero para una 1.0 conviene resolverlo.
+>
+> El remoto **ya está configurado** (`origin` →
+> `github.com/AlexandreInking/TeatroPlayer`), así que ese punto se cerró.
 >
 > Y las comprobaciones que exigen instalar de verdad (instalar sin
 > administrador, desinstalar sin restos, doble clic en un `.tpshow`, ZIP
 > portable en otra máquina) están en `Docs/14` §6.
+
+### T-PERF-001 — El camino caliente de la ganancia, a la mitad
+**Entregable:** `LiveGain` y `GainRamp` calculan la ganancia una vez por frame, y la sincronía con la UI no paga una barrera de memoria por muestra.
+**Prueba:** `cargo test --release --test perfil_ganancia -- --nocapture`
+**Criterio:** la rampa baja de ~20 ns/muestra (y el margen frente al presupuesto de audio crece).
+
+> **Estado: ✅ HECHO (2026-09-22).**
+>
+> `next()` se ejecuta **una vez por muestra** en el hilo de audio. A 48 kHz y 8
+> pistas son ~384 000 llamadas por segundo, así que cualquier operación de más
+> se multiplica por millones. Se midió antes de tocar nada:
+>
+> ```
+> A) rampa 30 s     : 117,6 ms  (20,4 ns/muestra)
+> B) sin rampa      :  16,8 ms  ( 2,9 ns/muestra)
+> ```
+>
+> Dos cosas sobraban, y las dos se veían en el código sin herramientas:
+>
+> 1. **Una barrera `SeqCst` por muestra.** El `seq` que publica la UI se leía
+>    con `SeqCst`, que en x86 es un `lock` real: la instrucción más cara de todo
+>    el bucle. Basta con `Release` al publicar y `Acquire` al leer — eso ya
+>    garantiza que los parámetros son visibles antes que el `seq`, que es lo
+>    único que hacía falta.
+> 2. **Aritmética repetida por canal.** La ganancia depende **solo del índice de
+>    frame**, no de la muestra, así que en estéreo el canal derecho volvía a
+>    calcular la misma curva que el izquierdo. Se cachea la ganancia del frame
+>    en curso y se reutiliza: la mitad de los cálculos de curva, gratis.
+>
+> Después:
+>
+> ```
+> A) rampa 30 s     :  58,7 ms  (10,2 ns/muestra)   <- 2,0x más rápido
+> B) sin rampa      :  16,4 ms  ( 2,9 ns/muestra)
+> ```
+>
+> **Qué NO se tocó, a propósito:** la forma de la curva y el determinismo. La
+> caché devuelve exactamente el mismo `f32` que antes; lo prueba
+> `la_cache_de_frame_no_desfasa_los_canales` (`src/engine/live.rs`), que compara
+> canal L y R **bit a bit** durante una rampa entera. Es el tipo de optimización
+> que se rompe en silencio —un canal desfasado del otro— y sin ese test no se
+> oiría hasta el estreno.
+>
+> El presupuesto real: un callback de cpal son 128 muestras / 2,67 ms. Con 8
+> pistas hay que gastar <312 ns por muestra; ahora mismo el margen es **30x**.
+
+### T-PERF-002 — Los paquetes salen a `dist/`, fuera del repositorio
+**Entregable:** instalador y ZIP portable en `dist/` (ignorado por git), no en `target/release/`.
+**Prueba:** `git check-ignore -v dist/TeatroPlayer-Instalador.exe`
+**Criterio:** los dos artefactos no aparecen en `git status` y sobreviven a `cargo clean`.
+
+> **Estado: ✅ HECHO (2026-09-22).** `target/` es una carpeta de compilación: se
+> borra con `cargo clean` y mezcla lo que se reparte entre 9 GB de objetos
+> intermedios. Los paquetes pasan a `dist/`, que va en `.gitignore`, así que
+> tampoco entran al repositorio (el release se publica en GitHub).
+>
+> Trampa encontrada: **NSIS no crea la carpeta de `OutFile`** y falla con un
+> `Can't open output file` que no dice por qué. `scripts\instalador.ps1` y
+> `scripts\publicar.ps1` hacen `New-Item -Force` antes de llamar a makensis.
 
 ---
 

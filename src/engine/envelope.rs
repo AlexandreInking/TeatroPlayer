@@ -67,6 +67,10 @@ pub struct GainRamp<S> {
     from: f32,
     to: f32,
     curve: Curve,
+    /// Última ganancia calculada y para qué frame. Dentro de un mismo frame la
+    /// ganancia no cambia (`gain_at` solo depende del índice de frame), así que
+    /// en estéreo se calcula una vez y se reutiliza para el segundo canal.
+    frame_cache: (u64, f32),
 }
 
 impl<S> GainRamp<S>
@@ -88,6 +92,11 @@ where
             from,
             to,
             curve,
+            // El frame 0 se cachea como "sin calcular" (`u64::MAX`), porque la
+            // ganancia en el frame 0 es justo la que hay que devolver la primera
+            // vez y calcularla aquí sería trabajo tirado: `new` solo la necesita
+            // si `next()` se llama.
+            frame_cache: (u64::MAX, 0.0),
         }
     }
 
@@ -99,6 +108,18 @@ where
         let t = (frame as f32 / self.ramp_frames as f32).clamp(0.0, 1.0);
         let shape = shape_of(self.curve, t, self.to >= self.from);
         self.from + (self.to - self.from) * shape
+    }
+
+    /// Igual que [`GainRamp::gain_at`], pero recordando el último frame
+    /// calculado. Es el camino que usa el iterador: en estéreo la mitad de las
+    /// llamadas caen en el mismo frame y se ahorran la curva entera.
+    fn gain_cached(&mut self, frame: u64) -> f32 {
+        if self.frame_cache.0 == frame {
+            return self.frame_cache.1;
+        }
+        let g = self.gain_at(frame);
+        self.frame_cache = (frame, g);
+        g
     }
 
     /// Frame actual (para tests y diagnóstico).
@@ -177,7 +198,7 @@ where
         let sample = self.inner.next()?;
         let frame = self.sample_idx / self.channels.max(1) as u64;
         self.sample_idx += 1;
-        Some(sample * self.gain_at(frame))
+        Some(sample * self.gain_cached(frame))
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {

@@ -36,6 +36,12 @@ pub const WATCHDOG_INTERVAL: Duration = Duration::from_millis(250);
 /// Margen que se espera tras un fade out antes de cortar la pista.
 const MARGEN_TRAS_FADE: Duration = Duration::from_millis(60);
 
+/// Cada cuánto el vigilante de un fade mira si la rampa ya terminó.
+///
+/// No afecta a la precisión del fade —la rampa la calcula el hilo de audio
+/// muestra a muestra— sino a cuánto tarda en cerrarse la cola después.
+const VIGILANTE_FADE: Duration = Duration::from_millis(20);
+
 /// Ajustes del limitador de máster (T-ENG-004).
 ///
 /// **No** son los de `LimitSettings::default()` y conviene saber por qué. El
@@ -99,7 +105,51 @@ struct RodioTrack {
     duracion: Option<Duration>,
     stopped: Arc<AtomicBool>,
     fading: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
     failed: Arc<Mutex<Option<String>>>,
+}
+
+impl RodioTrack {
+    /// Vigila el fade y corta la pista cuando la rampa se ha recorrido.
+    ///
+    /// Antes esto era `sleep(fade)` y ya está. Se cambió porque con la pausa
+    /// ese temporizador miente: la sala se queda en silencio un minuto y, al
+    /// volver, la pista ya se había cortado sola por debajo. El reloj que
+    /// importa es el de las muestras, así que se espera a que la envolvente
+    /// diga que ha terminado —cosa que no pasa mientras la pista está en
+    /// pausa, porque no se consume ninguna muestra—.
+    fn vigilar_fade(&self) {
+        let control = self.control.clone();
+        let player = Arc::clone(&self.player);
+        let stopped = Arc::clone(&self.stopped);
+        let fading = Arc::clone(&self.fading);
+        let paused = Arc::clone(&self.paused);
+
+        thread::spawn(move || {
+            loop {
+                if stopped.load(Ordering::SeqCst) {
+                    return; // alguien la cortó antes: aquí no pintamos nada
+                }
+                // El audio se acabó antes que el fade: no hay nada que esperar.
+                if player.empty() {
+                    break;
+                }
+                if control.rampa_terminada() && !paused.load(Ordering::SeqCst) {
+                    break;
+                }
+                thread::sleep(VIGILANTE_FADE);
+            }
+            // Margen corto para que el último tramo de la rampa salga entero
+            // por la tarjeta antes de cerrar la cola.
+            thread::sleep(MARGEN_TRAS_FADE);
+            if stopped.load(Ordering::SeqCst) {
+                return;
+            }
+            player.stop();
+            stopped.store(true, Ordering::SeqCst);
+            fading.store(false, Ordering::SeqCst);
+        });
+    }
 }
 
 impl TrackHandle for RodioTrack {
@@ -109,6 +159,9 @@ impl TrackHandle for RodioTrack {
         }
         if self.stopped.load(Ordering::SeqCst) {
             return TrackState::Stopped;
+        }
+        if self.paused.load(Ordering::SeqCst) {
+            return TrackState::Paused;
         }
         if self.fading.load(Ordering::SeqCst) {
             return TrackState::FadingOut;
@@ -146,23 +199,35 @@ impl TrackHandle for RodioTrack {
     fn stop_after(&self, fade: Duration, curve: Curve) {
         self.fading.store(true, Ordering::SeqCst);
         self.control.fade_out(fade, curve);
+        self.vigilar_fade();
+    }
 
-        // Un hilo por fade: en una función hay unos pocos por minuto, no miles.
-        let player = Arc::clone(&self.player);
-        let stopped = Arc::clone(&self.stopped);
-        let fading = Arc::clone(&self.fading);
-        thread::spawn(move || {
-            thread::sleep(fade + MARGEN_TRAS_FADE);
-            player.stop();
-            stopped.store(true, Ordering::SeqCst);
-            fading.store(false, Ordering::SeqCst);
-        });
+    fn pause(&self) {
+        // `Player::pause` no saca el source de la cola: deja de pedirle
+        // muestras. Así la posición y la envolvente se quedan clavadas, que es
+        // exactamente lo que tiene que hacer una pausa a media rampa.
+        self.player.pause();
+        self.paused.store(true, Ordering::SeqCst);
+    }
+
+    fn resume(&self) {
+        self.player.play();
+        self.paused.store(false, Ordering::SeqCst);
+    }
+
+    fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::SeqCst)
+    }
+
+    fn gain(&self) -> f32 {
+        self.control.gain()
     }
 
     fn stop(&self) {
         self.player.stop();
         self.stopped.store(true, Ordering::SeqCst);
         self.fading.store(false, Ordering::SeqCst);
+        self.paused.store(false, Ordering::SeqCst);
     }
 }
 
@@ -389,6 +454,24 @@ impl RodioBackend {
         spec: &CueSpec,
         source: AudioSource,
     ) -> Result<(Box<dyn Source<Item = f32> + Send>, EnvelopeControl)> {
+        cadena_de_audio(spec, source)
+    }
+}
+
+/// Construye la cadena de audio de una entrada: decodificar, saltar, aplicar
+/// el volumen, cortar si toca y, al final, la envolvente que hace los fades.
+///
+/// Es una función libre y no un método para que se pueda probar **sin tarjeta
+/// de sonido**: los tests montan esta misma cadena sobre un mixer en memoria y
+/// comprueban cuánto dura el fade de verdad. Antes vivía dentro del backend y
+/// nadie podía verificarla más que a oído.
+///
+/// Devuelve también el control de envolvente, que es el único sitio por donde
+/// se le puede pedir un fade a la pista ya montada.
+pub fn cadena_de_audio(
+    spec: &CueSpec,
+    source: AudioSource,
+) -> Result<(Box<dyn Source<Item = f32> + Send>, EnvelopeControl)> {
         let reader: Box<dyn AudioReader> = match source {
             AudioSource::File(path) => Box::new(BufReader::new(
                 File::open(&path)
@@ -441,9 +524,8 @@ impl RodioBackend {
             _ => Box::new(amplificado),
         };
 
-        let (live, control) = LiveGain::with_entrance(cortado, 1.0, Some(spec.entrance));
-        Ok((Box::new(live), control))
-    }
+    let (live, control) = LiveGain::with_entrance(cortado, 1.0, Some(spec.entrance));
+    Ok((Box::new(live), control))
 }
 
 impl AudioBackend for RodioBackend {
@@ -508,6 +590,7 @@ impl AudioBackend for RodioBackend {
             duracion,
             stopped: Arc::new(AtomicBool::new(false)),
             fading: Arc::new(AtomicBool::new(false)),
+            paused: Arc::new(AtomicBool::new(false)),
             failed: Arc::new(Mutex::new(None)),
         };
 
@@ -523,6 +606,24 @@ impl AudioBackend for RodioBackend {
             t.track.stop();
         }
         lock(&self.tracks).clear();
+    }
+
+    fn pause_all(&self) {
+        // Sólo las que siguen vivas: a una pista ya terminada no se le pide
+        // nada, y menos se le levanta el flag de pausa sin que suene.
+        for t in lock(&self.tracks).iter() {
+            if !t.track.state().is_done() {
+                t.track.pause();
+            }
+        }
+    }
+
+    fn resume_all(&self) {
+        for t in lock(&self.tracks).iter() {
+            if t.track.is_paused() {
+                t.track.resume();
+            }
+        }
     }
 
     fn set_master_limit(&self, enabled: bool) {

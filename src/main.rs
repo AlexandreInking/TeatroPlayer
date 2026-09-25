@@ -85,6 +85,42 @@ const CUE_COLORS: [egui::Color32; 8] = [
 // Las extensiones las define el modelo (`EXTENSIONES_AUDIO`), para que el
 // empaquetador y la interfaz usen exactamente la misma lista.
 
+// --- Medidas de la zona de reproductor --------------------------------------
+//
+// El panel de abajo crece con lo que hay sonando: es una lista de pistas, y
+// una lista no puede tener un alto fijo sin dejar fuera justo la pista que al
+// operador le interesa. De ahí que el alto se calcule y no se declare.
+//
+// Los números van **holgados a propósito**. Un panel `exact_size` al que le
+// falta un píxel no avisa: recorta. Al que le sobra, sólo le queda un poco de
+// aire abajo. Entre los dos fallos, el que no se nota es el segundo.
+
+/// Alto de un botón de mandos. Es lo que hay que poder alcanzar de un
+/// manotazo: no se toca.
+const ALTO_BOTON_MANDOS: f32 = 38.0;
+/// Ancho de un botón de mandos. Con icono en vez de texto el ancho ya no lo
+/// dicta la palabra —"PARAR TODO" pedía 150— así que va ajustado.
+const ANCHO_BOTON_MANDOS: f32 = 44.0;
+/// Alto de la fila de mandos **y** de lo que cuelga de ella dentro del panel:
+/// el separador y el aviso de "nada sonando".
+///
+/// Va **holgado a propósito**, y no es cuestión de estética: un panel
+/// `exact_size` al que le falta un píxel no avisa. Recorta, y encima engaña
+/// —cuando el contenido no cabe, egui reancla el panel a su borde de abajo, le
+/// deja el hueco de más al panel central, y el panel central acaba pintándose
+/// **encima** de la mitad de arriba de los botones—. Al que le sobra, sólo le
+/// queda un poco de aire abajo.
+const ALTO_MANDOS: f32 = 92.0;
+/// Alto de cada fila de la lista: la fila (24) con su margen, más el hueco que
+/// egui deja entre dos widgets seguidos.
+const ALTO_FILA_ACTIVO: f32 = 36.0;
+/// Alto que se lleva el registro cuando está abierto: su separador y el tope
+/// de scroll de las líneas (90), con aire.
+const ALTO_REGISTRO: f32 = 108.0;
+/// Tope del panel. Por encima de esto la lista hace scroll: si no, una función
+/// con ocho pistas sonando dejaría la lista de audios en un par de dedos.
+const ALTO_TRANSPORTE_MAX: f32 = 320.0;
+
 // ---------------------------------------------------------------------------
 // Las dos listas del panel central
 // ---------------------------------------------------------------------------
@@ -204,6 +240,56 @@ impl Entrada {
     fn estado(&self) -> Option<TrackState> {
         self.pista.as_ref().map(|p| p.state())
     }
+
+    /// Congelada donde estaba. **Sigue contando como sonando**: la pista no se
+    /// ha ido, está parada a media muestra.
+    fn pausada(&self) -> bool {
+        self.pista.as_ref().is_some_and(|p| p.is_paused())
+    }
+
+    /// Ganancia que el motor está aplicando ahora mismo (0.0–1.0), sin contar
+    /// el volumen. Es lo que deja **ver** un fade en curso en la zona de
+    /// reproductor: si sube poco a poco, la rampa va; si salta a 1, no hay.
+    fn ganancia(&self) -> f32 {
+        self.pista.as_ref().map(|p| p.gain()).unwrap_or(0.0)
+    }
+
+    /// true si suena en bucle sin fin.
+    ///
+    /// Es la condición que decide qué vuelve al pulsar PLAY después de un
+    /// STOP: un bucle estaba pensado para durar toda la escena, un efecto de
+    /// una sola pasada ya se oyó y repetirlo sería un susto.
+    fn en_bucle(&self) -> bool {
+        matches!(self.spec.loop_mode, LoopMode::Infinite)
+    }
+
+    /// Cómo se llama el botón que la saca, según lo que vaya a hacer de verdad.
+    ///
+    /// El botón no puede decir siempre lo mismo: con una salida configurada de
+    /// "fade out" la pista tarda en irse, y eso el operador tiene que saberlo
+    /// **antes** de pulsar, no después.
+    fn rotulo_salida(&self) -> &'static str {
+        match self.spec.exit {
+            ExitMode::FadeOut { .. } => "SALIR",
+            ExitMode::Hit => "CORTA",
+            ExitMode::UntilEnd => "PARAR",
+        }
+    }
+
+    /// Qué va a pasar al pulsar ese botón, para el tooltip.
+    fn ayuda_salida(&self) -> String {
+        match self.spec.exit {
+            ExitMode::FadeOut { duration, .. } => {
+                format!("Sale con un fade out de {}", formatear(duration))
+            }
+            ExitMode::Hit => "Corta de golpe".to_string(),
+            ExitMode::UntilEnd => {
+                "No tiene salida configurada, así que corta ya. Para que salga con fade, \
+                 elige «Sale con fade out» en «Cómo sale»."
+                    .to_string()
+            }
+        }
+    }
 }
 
 /// Un evento en vivo: el evento guardado más las pistas que estén sonando.
@@ -253,6 +339,22 @@ impl EventoVivo {
             }
         }
     }
+
+    /// Congelada donde estaba. Igual que en `Entrada`, sigue contando como
+    /// sonando.
+    fn pausada(&self) -> bool {
+        self.pistas.iter().flatten().any(|t| t.is_paused())
+    }
+
+    /// La ganancia más alta de sus pistas: si alguna está en rampa, se ve.
+    fn ganancia(&self) -> f32 {
+        self.pistas.iter().flatten().map(|t| t.gain()).fold(0.0, f32::max)
+    }
+
+    /// true si el evento suena en bucle sin fin (es lo que devuelve PLAY).
+    fn en_bucle(&self) -> bool {
+        self.evento.infinito()
+    }
 }
 
 /// Foto del estado para deshacer: entradas **y** eventos.
@@ -267,7 +369,7 @@ struct Instantanea {
 /// Los dos tienen tecla y pad, así que el editor es el mismo y sólo cambia
 /// dónde se guarda. El `sal` distingue los combo boxes de uno y de otro, que si
 /// no compartirían id dentro de egui y se pisarían.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Objeto {
     Audio(usize),
     Evento(usize),
@@ -280,6 +382,67 @@ impl Objeto {
             Objeto::Evento(_) => "evento",
         }
     }
+}
+
+/// Lo que se le puede pedir a una pista desde la zona de reproductor.
+///
+/// Son los tres gestos de cualquier reproductor, y los tres son distintos de
+/// verdad, no tres nombres para lo mismo:
+///
+/// - `Pausar` congela **donde está**: la posición y la envolvente se quedan
+///   intactas, aunque sea a media rampa y a mitad de un bucle.
+/// - `Seguir` la descongela en esa misma muestra, con el fade por donde iba.
+/// - `Parar` la saca. Es el único destructivo: después ya no hay a dónde
+///   volver, y por eso PLAY no puede devolver un efecto de una sola pasada.
+///   Sobre un **audio** no corta a lo bruto: obedece a la salida que ese audio
+///   tenga configurada en el inspector (ver [`App::aplicar_accion`]), que es lo
+///   que hace que la sección "Cómo sale" sirva de algo.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Accion {
+    Seguir,
+    Pausar,
+    Parar,
+}
+
+impl Accion {
+    fn aplicar(self, p: &dyn TrackHandle) {
+        match self {
+            Accion::Seguir => p.resume(),
+            Accion::Pausar => p.pause(),
+            Accion::Parar => p.stop(),
+        }
+    }
+
+    fn rotulo(self) -> &'static str {
+        match self {
+            Accion::Seguir => "SEGUIR",
+            Accion::Pausar => "PAUSA",
+            Accion::Parar => "PARAR",
+        }
+    }
+}
+
+/// Una fila de la zona de reproductor: una pista que está sonando **ahora**.
+///
+/// Es una foto, no una referencia: se recoge antes de pintar para no tener
+/// `self` prestado mientras se dibuja, y se pinta después.
+struct Activo {
+    /// A qué audio o evento pertenece, para saber a quién mandarle la orden.
+    quien: Objeto,
+    nombre: String,
+    color: egui::Color32,
+    pos: Option<Duration>,
+    total: Option<Duration>,
+    ganancia: f32,
+    pausado: bool,
+    saliendo: bool,
+    bucle: bool,
+    /// Cómo se llama el botón que la saca, y qué va a hacer.
+    ///
+    /// Se copian aquí y no se leen de `Entrada` al pintar porque dentro del
+    /// bucle de pintado `self` está prestado.
+    rotulo_salida: &'static str,
+    ayuda_salida: String,
 }
 
 /// Asistente para crear un evento: primero el tipo, luego los audios.
@@ -309,6 +472,15 @@ struct App {
     bloqueo: Bloqueo,
     /// Dispara la entrada siguiente cuando toca (T-SHOW-002).
     programador: Programador,
+
+    /// Lo que sonaba **en bucle** cuando se pulsó PARAR.
+    ///
+    /// Es la memoria de STOP. PLAY devuelve exactamente esto y nada más: un
+    /// efecto de una sola pasada no entra aquí, porque ya se oyó entero y
+    /// repetirlo en mitad de la función sería un susto, no una reanudación.
+    /// Un audio que estaba sonando pero no en bucle tampoco: lo que se
+    /// reanuda son los ambientes, no los remates.
+    reanudables: Vec<Objeto>,
 
     /// Dónde está guardada la obra ahora mismo. `None` = nunca se guardó.
     ruta: Option<PathBuf>,
@@ -361,6 +533,7 @@ impl App {
             asistente: None,
             bloqueo: Bloqueo::nuevo(),
             programador: Programador::nuevo(),
+            reanudables: Vec::new(),
             ruta: None,
             sucio: false,
             solo_lectura: false,
@@ -482,6 +655,9 @@ impl App {
             }
         }
         self.entradas.truncate(total);
+        // La memoria de STOP son índices, y deshacer cambia lo que hay en
+        // cada índice: se olvida en vez de devolver el audio equivocado.
+        self.reanudables.clear();
         if self.seleccionada.is_some_and(|i| i >= self.entradas.len()) {
             self.seleccionada = None;
         }
@@ -614,6 +790,8 @@ impl App {
         self.ruta = None;
         self.sucio = false;
         self.solo_lectura = false;
+        // La obra anterior se fue: sus bucles ya no existen.
+        self.reanudables.clear();
         self.anotar("obra nueva");
     }
 
@@ -646,6 +824,8 @@ impl App {
 
         self.entradas.clear();
         self.eventos.clear();
+        // Otra obra: los bucles apuntados eran de la anterior.
+        self.reanudables.clear();
         for (i, cue) in sesion.cues.iter().enumerate() {
             let entrada = format!("audio/{}", cue.audio.file_name);
             // Sin nombre de archivo no hay nada que buscar: la fila sale
@@ -755,6 +935,7 @@ impl App {
             v.parar();
         }
         self.eventos.remove(i);
+        self.reanudables.clear();
         self.sucio = true;
         self.auto.pedir();
         if self.evento_sel == Some(i) {
@@ -773,6 +954,7 @@ impl App {
             return;
         }
         self.eventos.swap(i, destino as usize);
+        self.reanudables.clear();
         self.sucio = true;
         self.auto.pedir();
         if self.evento_sel == Some(i) {
@@ -804,12 +986,58 @@ impl App {
         self.auto.pedir();
     }
 
-    /// El audio de la lista al que apunta un hueco de un evento.
-    fn fuente_de_evento(&self, pista: &PistaEvento) -> Option<Fuente> {
+    /// Índice en `entradas` del audio al que apunta un hueco de un evento.
+    ///
+    /// Se busca por `fileName` y no por posición: el evento guarda el nombre
+    /// del archivo, así que sigue apuntando al mismo audio aunque el operador
+    /// reordene la lista (`Docs/04` §3).
+    fn indice_de_evento(&self, pista: &PistaEvento) -> Option<usize> {
         self.entradas
             .iter()
-            .find(|e| !e.audio.file_name.is_empty() && e.audio.file_name == pista.audio.file_name)
-            .map(|e| e.fuente.clone())
+            .position(|e| !e.audio.file_name.is_empty() && e.audio.file_name == pista.audio.file_name)
+    }
+
+    /// El audio de la lista al que apunta un hueco de un evento.
+    fn fuente_de_evento(&self, pista: &PistaEvento) -> Option<Fuente> {
+        self.indice_de_evento(pista).map(|i| self.entradas[i].fuente.clone())
+    }
+
+    /// Dónde está sonando ya ese archivo, si es que está sonando en algún sitio.
+    /// Devuelve de quién es y si está congelado.
+    ///
+    /// La identidad de un audio es **su archivo** (`AudioRef::file_name`): es lo
+    /// mismo por lo que un evento encuentra su audio en la lista, y es lo que
+    /// sobrevive a reordenar, a renombrar la fila y a reabrir la obra. Por eso
+    /// la comprobación cruza las dos listas: un audio puede estar sonando como
+    /// fila o dentro de un evento, y en los dos casos es el mismo audio sonando.
+    ///
+    /// `excepto` deja fuera a quien se está comprobando. Hace falta al relanzar
+    /// un evento: su propia copia anterior todavía está montada en ese momento,
+    /// y sin excluirla el evento se bloquearía a sí mismo.
+    fn donde_suena(&self, file_name: &str, excepto: Option<Objeto>) -> Option<(String, bool)> {
+        // Sin nombre de archivo no hay identidad que comparar (una fila sin
+        // audio). Comparar vacíos haría que todas las filas rotas se estorbaran
+        // entre sí.
+        if file_name.is_empty() {
+            return None;
+        }
+        for (i, e) in self.entradas.iter().enumerate() {
+            if excepto == Some(Objeto::Audio(i)) {
+                continue;
+            }
+            if e.sonando() && e.audio.file_name == file_name {
+                return Some((e.nombre.clone(), e.pausada()));
+            }
+        }
+        for (i, v) in self.eventos.iter().enumerate() {
+            if excepto == Some(Objeto::Evento(i)) {
+                continue;
+            }
+            if v.sonando() && v.evento.pistas.iter().any(|p| p.audio.file_name == file_name) {
+                return Some((v.evento.nombre.clone(), v.pausada()));
+            }
+        }
+        None
     }
 
     /// Construye la `Sesion` a partir de lo que hay en pantalla.
@@ -925,6 +1153,9 @@ impl App {
             }
         }
         self.entradas.remove(i);
+        // Borrar una fila corre todos los índices de detrás: la memoria de
+        // STOP dejaría de apuntar a lo que apuntaba.
+        self.reanudables.clear();
         // Un evento que usara este audio se queda sin él: hay que decirlo.
         self.refrescar_falta_eventos();
         self.sucio = true;
@@ -945,6 +1176,8 @@ impl App {
             return;
         }
         self.entradas.swap(i, destino as usize);
+        // Reordenar también mueve los índices.
+        self.reanudables.clear();
         self.sucio = true;
         self.auto.pedir();
         if self.seleccionada == Some(i) {
@@ -967,6 +1200,43 @@ fn ir(&mut self, i: usize) {
             self.anotar(format!("FALTA EL AUDIO de '{}'", entrada.nombre));
             return;
         }
+
+        // Un audio **no se dispara sobre sí mismo**. Dos copias del mismo
+        // archivo desfasadas unos segundos no son "más ambiente": son un eco
+        // sucio. Si el original ya va por el segundo 20 y se le da otra vez a
+        // GO, lo que se oye es el mismo audio en el 0 y en el 20 a la vez, y
+        // repitiendo el gesto se apilan tantas copias que aquello es un caos
+        // del que no se sale. Un GO sobre algo que ya suena no es un disparo:
+        // es un accidente, y se avisa en vez de obedecer.
+        //
+        // Lo que sí se puede es apilar audios **distintos** (un ambiente, una
+        // música y un efecto a la vez): lo prohibido es el mismo dos veces.
+        //
+        // Se mira dos veces a propósito. Primero esta fila, que da el mensaje
+        // más directo ("ya está sonando"); y después si ese mismo archivo suena
+        // **por otro sitio**, que es el caso que se cuela: un audio lanzado
+        // dentro de un evento lleva su propia pista, así que la fila de la lista
+        // no sabe nada de él y las dos copias convivirían sin enterarse.
+        if self.entradas[i].sonando() {
+            let como = if self.entradas[i].pausada() { "en pausa" } else { "sonando" };
+            self.anotar(format!(
+                "'{}' ya está {como}: no se apila una segunda copia encima",
+                self.entradas[i].nombre
+            ));
+            self.seleccionada = Some(i);
+            return;
+        }
+        let fichero = self.entradas[i].audio.file_name.clone();
+        if let Some((quien, pausado)) = self.donde_suena(&fichero, Some(Objeto::Audio(i))) {
+            let como = if pausado { "en pausa" } else { "sonando" };
+            self.anotar(format!(
+                "'{}' ya está {como} en '{quien}': el mismo audio no se apila",
+                self.entradas[i].nombre
+            ));
+            self.seleccionada = Some(i);
+            return;
+        }
+
         let spec = entrada.spec.clone();
         let fuente = entrada.fuente.clone();
         let nombre = entrada.nombre.clone();
@@ -1073,6 +1343,29 @@ fn ir(&mut self, i: usize) {
             return;
         }
 
+        // El audio que entra tampoco puede estar ya sonando, ni por su cuenta
+        // ni dentro de otro evento: el evento montaría una segunda copia del
+        // mismo archivo sobre la que ya va, que es justo el eco que hay que
+        // evitar. Aquí se ve muy bien por qué: un crossfade que trae un
+        // ambiente ya sonando no cruzaría nada, apilaría el ambiente sobre sí
+        // mismo.
+        //
+        // Se excluye este mismo evento del registro: relanzarlo es reiniciarlo,
+        // y eso sí se permite (abajo se para la copia anterior antes de montar
+        // la nueva). Sin excluirlo, un evento se bloquearía a sí mismo.
+        if let Some(pista) = evento.pistas.first() {
+            if let Some((quien, pausado)) =
+                self.donde_suena(&pista.audio.file_name, Some(Objeto::Evento(i)))
+            {
+                let como = if pausado { "en pausa" } else { "sonando" };
+                self.anotar(format!(
+                    "'{}': su audio ya está {como} en '{quien}'; el evento no monta una segunda copia",
+                    evento.nombre
+                ));
+                return;
+            }
+        }
+
         // Relanzar un evento que ya está sonando lo reinicia: no se montan dos
         // copias del mismo audio encima.
         self.eventos[i].parar();
@@ -1147,6 +1440,7 @@ fn ir(&mut self, i: usize) {
         let objetivo = objetivo_pct as f32 / 100.0;
         let mut cuantas = 0;
 
+        // Audios de la lista principal
         for e in &mut self.entradas {
             let Some(p) = e.pista.as_ref() else { continue };
             if p.state().is_done() {
@@ -1159,14 +1453,57 @@ fn ir(&mut self, i: usize) {
             }
             cuantas += 1;
         }
+        // Audios lanzados por eventos: un crossfade tiene que bajar lo que
+        // esté sonando venga de donde venga —si sólo se mirara `entradas`,
+        // un ambiente que entró por un FadeIn se quedaría sonando encima
+        // del crossfade, que es justo el "no pasa" que reportó el usuario.
+        for v in &mut self.eventos {
+            for p in v.pistas.iter().flatten() {
+                if p.state().is_done() {
+                    continue;
+                }
+                if objetivo <= 0.0 {
+                    p.stop_after(duracion, curva);
+                } else {
+                    p.fade_to(objetivo, duracion, curva);
+                }
+                cuantas += 1;
+            }
+        }
         cuantas
     }
 
-    /// Parada de emergencia (T-SHOW-003): fade corto y corte.
+    /// Parada (T-SHOW-003): fade corto y corte.
     ///
     /// El fade no es un adorno: cortar un PCM a mitad de ciclo se oye como un
     /// clic, y en una sala eso suena a fallo del equipo.
+    ///
+    /// Antes de cortar nada se apunta **qué bucles estaban sonando**, porque
+    /// esa lista es lo único que PLAY devuelve después. Se apunta aquí y no en
+    /// el botón para que cualquier parada —el botón, un atajo, lo que sea—
+    /// deje la misma memoria.
+    ///
+    /// Un efecto de una sola pasada **no** se apunta: ya se oyó entero y
+    /// repetirlo en mitad de la función sería un susto, no una reanudación.
+    /// Es la diferencia que pidió el usuario entre parar y pausar: la pausa
+    /// no pierde nada, la parada sólo guarda lo que estaba en bucle.
     fn parar_todo(&mut self) {
+        self.reanudables = self
+            .entradas
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.sonando() && e.en_bucle())
+            .map(|(i, _)| Objeto::Audio(i))
+            .chain(
+                self.eventos
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, v)| v.sonando() && v.en_bucle())
+                    .map(|(i, _)| Objeto::Evento(i)),
+            )
+            .collect();
+        let apuntados = self.reanudables.len();
+
         let fade = Duration::from_millis(show::FADE_EMERGENCIA_MS);
         self.backend.stop_all_con_fade(fade);
         self.programador.cancelar();
@@ -1180,10 +1517,12 @@ fn ir(&mut self, i: usize) {
             v.parar();
         }
         self.backend.stop_all();
-        self.anotar(format!(
-            "parada de emergencia (fade {} ms)",
-            show::FADE_EMERGENCIA_MS
-        ));
+        self.anotar(format!("PARAR: todo cortado (fade {} ms)", show::FADE_EMERGENCIA_MS));
+        match apuntados {
+            0 => self.anotar("  · no había ningún bucle sonando: PLAY no tendrá qué devolver"),
+            1 => self.anotar("  · 1 bucle apuntado: PLAY lo devuelve"),
+            n => self.anotar(format!("  · {n} bucles apuntados: PLAY los devuelve")),
+        }
     }
 
     fn probar_salida(&mut self) {
@@ -1207,6 +1546,318 @@ fn ir(&mut self, i: usize) {
         for v in &mut self.eventos {
             v.limpiar_terminadas();
         }
+    }
+
+    // --- transporte global ------------------------------------------------
+    //
+    // Los tres gestos de un reproductor, aplicados a todo lo que suena. La
+    // diferencia entre ellos no es de matiz, es de qué se puede recuperar
+    // después:
+    //
+    // | gesto  | posición | envolvente | se puede volver atrás |
+    // |--------|----------|------------|-----------------------|
+    // | PAUSA  | se queda | se queda   | sí, tal cual          |
+    // | SEGUIR | sigue    | sigue      | —                     |
+    // | PARAR  | se pierde| se pierde  | sólo los bucles       |
+    //
+    // De ahí la asimetría de PLAY: lo que se pausó vuelve donde estaba, y lo
+    // que se paró sólo vuelve si era un bucle.
+
+    /// true si hay algo congelado ahora mismo.
+    fn hay_pausa(&self) -> bool {
+        self.entradas.iter().any(|e| e.pausada()) || self.eventos.iter().any(|v| v.pausada())
+    }
+
+    /// Cuántas pistas están sonando ahora, contando las congeladas.
+    fn cuantos_activos(&self) -> usize {
+        self.entradas.iter().filter(|e| e.sonando()).count()
+            + self.eventos.iter().filter(|v| v.sonando()).count()
+    }
+
+    /// Congela todo donde está.
+    ///
+    /// Es lo contrario de parar: aquí no se pierde nada. Un bucle se queda a
+    /// mitad de vuelta, un efecto de una sola pasada se queda en su segundo
+    /// doce, y un fade se queda a media rampa. Todo eso vuelve exactamente
+    /// igual, porque una pista en pausa no consume muestras y el motor mide
+    /// sus rampas en muestras, no en reloj.
+    fn pausar_todo(&mut self) {
+        if self.cuantos_activos() == 0 {
+            self.anotar("PAUSA: no hay nada sonando");
+            return;
+        }
+        let mut cuantas = 0;
+        self.por_cada_pista(|p| {
+            if !p.is_paused() {
+                p.pause();
+                cuantas += 1;
+            }
+        });
+        match cuantas {
+            0 => self.anotar("PAUSA: ya estaba todo congelado"),
+            n => self.anotar(format!("PAUSA: {n} pista(s) congeladas donde estaban")),
+        }
+    }
+
+    /// Pasa por todas las pistas vivas que la app tiene montadas.
+    ///
+    /// Se recorre lo que tiene la app y **no** el registro interno del motor,
+    /// y eso es a propósito: lo que obedecen los mandos tiene que ser
+    /// exactamente lo que enseña la zona de reproductor, ni una pista más ni
+    /// una menos. Si los dos criterios se separaran, el operador vería una
+    /// fila que no responde o, peor, se pararía algo que no está en la lista.
+    fn por_cada_pista(&mut self, mut f: impl FnMut(&dyn TrackHandle)) {
+        for e in &mut self.entradas {
+            if let Some(p) = e.pista.as_deref() {
+                if !p.state().is_done() {
+                    f(p);
+                }
+            }
+        }
+        for v in &mut self.eventos {
+            for p in v.pistas.iter().flatten() {
+                if !p.state().is_done() {
+                    f(p.as_ref());
+                }
+            }
+        }
+    }
+
+    /// El botón PLAY, que hace dos cosas distintas según de dónde venga.
+    ///
+    /// Si hay algo en pausa, sigue donde estaba: la pausa no perdió nada, así
+    /// que no hay nada que reconstruir. Si no hay nada en pausa, se viene de
+    /// una parada, y entonces se devuelven los bucles que la parada apuntó.
+    ///
+    /// Los dos casos no se mezclan en la práctica —parar descongela todo—, así
+    /// que no hay ambigüedad en el orden en que se comprueban.
+    fn reproducir(&mut self) {
+        if self.hay_pausa() {
+            let mut cuantas = 0;
+            self.por_cada_pista(|p| {
+                if p.is_paused() {
+                    p.resume();
+                    cuantas += 1;
+                }
+            });
+            self.anotar(format!("PLAY: {cuantas} pista(s) siguen donde se quedaron"));
+            return;
+        }
+        self.reanudar_parada();
+    }
+
+    /// Devuelve los bucles que sonaban al parar.
+    fn reanudar_parada(&mut self) {
+        if self.reanudables.is_empty() {
+            self.anotar("PLAY: no hay nada que reanudar (la última parada no apuntó ningún bucle)");
+            return;
+        }
+        // La lista se vacía al usarla: si se quedara, un segundo PLAY montaría
+        // otra vez los mismos bucles encima de sí mismos, que es justo lo que
+        // no puede pasar.
+        let lista = std::mem::take(&mut self.reanudables);
+        let mut puestas = 0;
+        for quien in lista {
+            let ok = match quien {
+                Objeto::Audio(i) => self.relanzar_en_sitio(i),
+                Objeto::Evento(i) => self.relanzar_evento_en_sitio(i),
+            };
+            if ok {
+                puestas += 1;
+            }
+        }
+        self.anotar(format!("PLAY: {puestas} bucle(s) de vuelta"));
+    }
+
+    /// Vuelve a poner en marcha una entrada **tal cual estaba**.
+    ///
+    /// `ir()` monta la escena: aplica `on_previous` a lo que suena, agenda el
+    /// retardo, programa el auto-follow. Al reanudar una parada no queremos
+    /// nada de eso. Si se usara `ir()`, devolver tres ambientes a la vez sería
+    /// un desastre: el segundo que arranca le aplicaría su `on_previous` al
+    /// primero que se acaba de arrancar, y entre ellos se apagarían. Lo que
+    /// hay que hacer es volver a ponerlos en marcha, no volver a montar la
+    /// escena.
+    fn relanzar_en_sitio(&mut self, i: usize) -> bool {
+        let Some(e) = self.entradas.get(i) else { return false };
+        if e.falta {
+            let nombre = e.nombre.clone();
+            self.anotar(format!("no se puede reanudar '{nombre}': falta el audio"));
+            return false;
+        }
+        let spec = e.spec.clone();
+        let fuente = e.fuente.clone();
+        let nombre = e.nombre.clone();
+        match self.backend.play(&spec, fuente.como_audio_source()) {
+            Ok(pista) => {
+                self.entradas[i].pista = Some(pista);
+                self.entradas[i].duck = false;
+                self.anotar(format!("  · {nombre}"));
+                true
+            }
+            Err(err) => {
+                self.anotar(format!("no se pudo reanudar '{nombre}': {err}"));
+                false
+            }
+        }
+    }
+
+    /// Lo mismo que [`Self::relanzar_en_sitio`], para un evento.
+    fn relanzar_evento_en_sitio(&mut self, i: usize) -> bool {
+        let Some(v) = self.eventos.get(i) else { return false };
+        if v.falta || !v.evento.completo() {
+            return false;
+        }
+        let evento = v.evento.clone();
+        let Some(spec) = evento.spec_entrada() else { return false };
+        let Some(hueco) = evento.pistas.first().cloned() else { return false };
+        let Some(fuente) = self.fuente_de_evento(&hueco) else {
+            self.anotar(format!("no se puede reanudar '{}': falta el audio", evento.nombre));
+            return false;
+        };
+        let nombre = hueco.nombre.clone();
+        match self.backend.play(&spec, fuente.como_audio_source()) {
+            Ok(pista) => {
+                self.eventos[i].pistas[0] = Some(pista);
+                self.anotar(format!("  · {nombre}"));
+                true
+            }
+            Err(err) => {
+                self.anotar(format!("no se pudo reanudar '{nombre}': {err}"));
+                false
+            }
+        }
+    }
+
+    /// Foto de todo lo que está sonando en este instante.
+    ///
+    /// Incluye lo congelado: una pista en pausa sigue montada, con su posición
+    /// y su envolvente, y el operador tiene que poder verla y seguirla desde
+    /// aquí.
+    fn activos(&self) -> Vec<Activo> {
+        let mut v: Vec<Activo> = Vec::new();
+        for (i, e) in self.entradas.iter().enumerate() {
+            if !e.sonando() {
+                continue;
+            }
+            v.push(Activo {
+                quien: Objeto::Audio(i),
+                nombre: e.nombre.clone(),
+                color: CUE_COLORS[e.color],
+                pos: e.pista.as_ref().map(|p| p.position()),
+                total: e.pista.as_ref().and_then(|p| p.duration()),
+                ganancia: e.ganancia(),
+                pausado: e.pausada(),
+                saliendo: matches!(e.estado(), Some(TrackState::FadingOut)),
+                bucle: e.en_bucle(),
+                rotulo_salida: e.rotulo_salida(),
+                ayuda_salida: e.ayuda_salida(),
+            });
+        }
+        for (i, ev) in self.eventos.iter().enumerate() {
+            if !ev.sonando() {
+                continue;
+            }
+            let p = ev.pistas.iter().flatten().next();
+            let tipo = match ev.evento.tipo {
+                TipoEvento::Golpe => "golpe",
+                TipoEvento::FadeIn => "fade in",
+                TipoEvento::FadeOut => "fade out",
+                TipoEvento::Crossfade => "crossfade",
+            };
+            v.push(Activo {
+                quien: Objeto::Evento(i),
+                nombre: format!("{} ({tipo})", ev.evento.nombre),
+                color: EVENT_COLORS[i % EVENT_COLORS.len()],
+                pos: p.map(|t| t.position()),
+                total: p.and_then(|t| t.duration()),
+                ganancia: ev.ganancia(),
+                pausado: ev.pausada(),
+                saliendo: p.is_some_and(|t| matches!(t.state(), TrackState::FadingOut)),
+                bucle: ev.en_bucle(),
+                // Un evento no tiene salida configurable: se corta y ya.
+                rotulo_salida: "PARAR",
+                ayuda_salida: "Un evento no tiene salida configurable: se corta."
+                    .to_string(),
+            });
+        }
+        v
+    }
+
+    /// Nombre legible de lo que hay en una fila, para el registro.
+    fn nombre_de(&self, quien: Objeto) -> String {
+        match quien {
+            Objeto::Audio(i) => self.entradas.get(i).map(|e| e.nombre.clone()),
+            Objeto::Evento(i) => self.eventos.get(i).map(|v| v.evento.nombre.clone()),
+        }
+        .unwrap_or_default()
+    }
+
+    /// Manda una orden de transporte a **una** pista: la de su fila.
+    ///
+    /// Los mandos de arriba son para todo a la vez; esto es para cuando el
+    /// operador quiere tocar una sola cosa sin mover el resto.
+    ///
+    /// `Parar` sobre un audio **no corta a lo bruto**: obedece a la salida que
+    /// ese audio tenga configurada en el inspector (`FR-04`). Es lo que hace que
+    /// la sección "Cómo sale" sirva de algo — hasta ahora se podía configurar
+    /// entera y no la leía nadie, así que poner "Sale con fade out" y que el
+    /// audio se cortara igual era lo normal. Un evento no tiene salida
+    /// configurable, así que ahí se corta.
+    fn aplicar_accion(&mut self, quien: Objeto, accion: Accion) {
+        let mut cuantas = 0usize;
+        let mut como = accion.rotulo();
+        match quien {
+            Objeto::Audio(i) => {
+                let salida = self.entradas.get(i).map(|e| e.spec.exit);
+                if let (Some(salida), Some(p)) =
+                    (salida, self.entradas.get(i).and_then(|e| e.pista.as_deref()))
+                {
+                    match (accion, salida) {
+                        (Accion::Parar, ExitMode::FadeOut { duration, curve }) => {
+                            p.stop_after(duration, curve);
+                            como = "SALIR";
+                        }
+                        _ => accion.aplicar(p),
+                    }
+                    cuantas = 1;
+                }
+            }
+            Objeto::Evento(i) => {
+                if let Some(v) = self.eventos.get(i) {
+                    for p in v.pistas.iter().flatten() {
+                        accion.aplicar(p.as_ref());
+                        cuantas += 1;
+                    }
+                }
+            }
+        }
+        if cuantas == 0 {
+            return;
+        }
+        let nombre = self.nombre_de(quien);
+        self.anotar(format!("{como}: {nombre}"));
+    }
+
+    /// Alto del panel de reproductor: una fila por pista activa, más los mandos.
+    ///
+    /// Se calcula **antes** de crear el panel porque egui necesita el alto de
+    /// antemano.
+    ///
+    /// `alto_ventana` es lo que se lleva el reproductor como mucho: **un
+    /// tercio**. En una pantalla baja, una función con ocho pistas sonando
+    /// dejaría la lista de audios —que es donde el operador hace clic— en nada.
+    /// A partir de ahí la lista de pistas hace scroll, y los mandos, que son lo
+    /// que hay que alcanzar de un manotazo, siguen siempre a la vista.
+    fn alto_transporte(&self, alto_ventana: f32) -> f32 {
+        let mut alto = ALTO_MANDOS + ALTO_FILA_ACTIVO * self.cuantos_activos() as f32;
+        if self.ver_registro {
+            alto += ALTO_REGISTRO;
+        }
+        // El tope nunca puede quedar por debajo del mínimo, o `clamp` entraría
+        // en pánico con el rango invertido. De ahí el `clamp` interior.
+        let tope = (alto_ventana / 3.0).clamp(ALTO_MANDOS, ALTO_TRANSPORTE_MAX);
+        alto.clamp(ALTO_MANDOS, tope)
     }
 }
 
@@ -1252,6 +1903,12 @@ enum IconKind {
     Editar,
     /// Teclas: cómo se dispara a mano.
     Teclado,
+    /// Triángulo: arranca, o sigue donde se quedó.
+    Play,
+    /// Dos barras: congela donde está, sin perder la posición.
+    Pausa,
+    /// Cuadrado: corta de verdad.
+    Detener,
 }
 
 fn dibujar_icono(painter: &egui::Painter, rect: egui::Rect, kind: IconKind, color: egui::Color32) {
@@ -1472,6 +2129,43 @@ fn dibujar_icono(painter: &egui::Painter, rect: egui::Rect, kind: IconKind, colo
                 egui::Stroke::NONE,
             ));
         }
+        // El transporte: los tres gestos de siempre, dibujados como en
+        // cualquier reproductor. Un triángulo, dos barras y un cuadrado.
+        IconKind::Play => {
+            let pad = w * 0.16;
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    egui::pos2(tl.x + pad, tl.y + pad),
+                    egui::pos2(tl.x + pad, br.y - pad),
+                    egui::pos2(br.x - pad * 0.5, c.y),
+                ],
+                fill,
+                egui::Stroke::NONE,
+            ));
+        }
+        IconKind::Pausa => {
+            let ancho = w * 0.2;
+            let alto = h * 0.7;
+            for k in 0..2 {
+                let x = tl.x + w * 0.27 + k as f32 * (ancho + w * 0.19);
+                painter.rect_filled(
+                    egui::Rect::from_min_size(
+                        egui::pos2(x, c.y - alto / 2.0),
+                        egui::vec2(ancho, alto),
+                    ),
+                    egui::CornerRadius::same(1),
+                    fill,
+                );
+            }
+        }
+        IconKind::Detener => {
+            let lado = w * 0.6;
+            painter.rect_filled(
+                egui::Rect::from_center_size(c, egui::vec2(lado, lado)),
+                egui::CornerRadius::same(1),
+                fill,
+            );
+        }
         // Rayo: un efecto que entra de golpe y se acaba.
         IconKind::Rayo => {
             let pts = [
@@ -1593,6 +2287,66 @@ fn boton_icono(
     response
 }
 
+/// Botón de la fila de mandos: rectangular, relleno de color y **sólo icono**.
+///
+/// El texto se cambió por iconos porque en esa fila el escaso es el ancho:
+/// "SEGUIR", "PAUSA" y "PARAR TODO" se comían media barra y dejaban el nombre
+/// de la salida en un susurro. Lo que un icono no puede decir —cuál de los dos
+/// gestos de PLAY va a ocurrir, por ejemplo— lo dice el tooltip, que es donde
+/// se busca cuando hace falta y no ocupa nada cuando no.
+///
+/// Se usa con `ui.add_enabled`, que ya se encarga de las dos cosas que debe
+/// hacer un botón apagado: bajar la opacidad de lo que se pinte y no contar el
+/// clic.
+struct BotonMandos {
+    icono: IconKind,
+    tooltip: &'static str,
+    relleno: egui::Color32,
+    color: egui::Color32,
+}
+
+impl BotonMandos {
+    fn nuevo(
+        icono: IconKind,
+        tooltip: &'static str,
+        relleno: egui::Color32,
+        color: egui::Color32,
+    ) -> Self {
+        Self {
+            icono,
+            tooltip,
+            relleno,
+            color,
+        }
+    }
+}
+
+impl egui::Widget for BotonMandos {
+    fn ui(self, ui: &mut egui::Ui) -> egui::Response {
+        let (rect, response) = ui.allocate_exact_size(
+            egui::vec2(ANCHO_BOTON_MANDOS, ALTO_BOTON_MANDOS),
+            egui::Sense::click(),
+        );
+
+        // Hundido mientras se mantiene pulsado, como los botones de texto.
+        let relleno = if response.is_pointer_button_down_on() {
+            self.relleno.gamma_multiply(0.85)
+        } else {
+            self.relleno
+        };
+        ui.painter()
+            .rect_filled(rect, egui::CornerRadius::same(6), relleno);
+
+        // El icono va en un cuadrado centrado: los tres gestos —triángulo, dos
+        // barras, cuadrado— se dibujan sobre su rect, y con uno más ancho que
+        // alto saldrían deformes.
+        let icono = egui::Rect::from_center_size(rect.center(), egui::vec2(20.0, 20.0));
+        dibujar_icono(ui.painter(), icono, self.icono, self.color);
+
+        response.on_hover_text(self.tooltip)
+    }
+}
+
 /// Cuadrado pequeño con solo icono: las flechas y la X de la fila.
 fn boton_icono_chico(
     ui: &mut egui::Ui,
@@ -1620,6 +2374,39 @@ fn boton_icono_chico(
 
 
     response
+}
+
+/// La barra que deja **ver** la envolvente de una pista.
+///
+/// Va aparte del volumen a propósito. El volumen es lo que el operador
+/// configuró: no cambia mientras suena, así que enseñarlo no diría nada. La
+/// envolvente es lo que el motor aplica en esta muestra, y es lo único que se
+/// mueve durante un fade. Enseñarla convierte el fade en algo visible, que es
+/// justo lo que hacía falta para poder decir "el fade va" o "esto entra de
+/// golpe" sin fiarse del oído en mitad de un ensayo.
+///
+/// En ámbar cuando la pista está congelada: la barra se queda quieta donde
+/// estaba, y el color avisa de que no se ha acabado, de que está en pausa.
+fn barra_envolvente(ui: &mut egui::Ui, ganancia: f32, pausado: bool) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(88.0, 12.0), egui::Sense::hover());
+    let p = ui.painter();
+    p.rect_filled(rect, egui::CornerRadius::same(3), BG_ROW_ACTIVE);
+    let g = ganancia.clamp(0.0, 1.0);
+    if g > 0.001 {
+        let lleno =
+            egui::Rect::from_min_size(rect.min, egui::vec2(rect.width() * g, rect.height()));
+        p.rect_filled(
+            lleno,
+            egui::CornerRadius::same(3),
+            if pausado { WARN_AMBER } else { GO_GREEN },
+        );
+    }
+    p.rect_stroke(
+        rect,
+        egui::CornerRadius::same(3),
+        egui::Stroke { width: 1.0, color: FG_MUTE },
+        egui::epaint::StrokeKind::Inside,
+    );
 }
 
 /// Pestaña con icono grande arriba y etiqueta debajo.
@@ -1995,7 +2782,12 @@ impl eframe::App for App {
             self.guardar();
         }
 
-        if self.entradas.iter().any(|e| e.sonando()) {
+        // Mientras haya algo montado se repinta seguido: la zona de
+        // reproductor mueve posiciones, envolventes y contadores, y una pista
+        // en pausa también cuenta (hay que poder ver dónde se quedó).
+        let hay_audio = self.entradas.iter().any(|e| e.sonando())
+            || self.eventos.iter().any(|v| v.sonando());
+        if hay_audio {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
     }
@@ -2008,7 +2800,7 @@ impl eframe::App for App {
             .show(ui, |ui| self.barra_superior(ui));
 
         egui::Panel::bottom("transporte")
-            .exact_size(58.0)
+            .exact_size(self.alto_transporte(ui.available_height()))
             .show(ui, |ui| self.transporte(ui));
 
         if self.bloqueo.permite_editar() {
@@ -2131,66 +2923,106 @@ impl App {
         });
     }
 
+    /// Zona de reproductor: los mandos globales y la lista de lo que suena.
+    ///
+    /// Es lo que faltaba para poder operar sin adivinar. Antes había un
+    /// "PARAR TODO" y un texto con los nombres de lo que sonaba; con eso no se
+    /// podía ni parar una sola cosa, ni saber si un fade estaba ocurriendo de
+    /// verdad. Ahora hay los tres gestos para todo el conjunto y, en cada fila,
+    /// seguir/pausar y **sacar esa pista** —que obedece a la salida que tenga
+    /// configurada—, con la envolvente a la vista.
     fn transporte(&mut self, ui: &mut egui::Ui) {
         // PARAR TODO y Probar sonaron por un clic en vuelo es exactamente lo
         // que no puede pasar: el primero corta la función, el segundo mete un
         // tono por la salida. Con la guarda de siempre.
         let clic_del_operador = self.clic_fiable();
-        ui.horizontal_centered(|ui| {
-            let parar = egui::Button::new(
-                egui::RichText::new("PARAR TODO").color(FG_STRONG).strong(),
-            )
-            .fill(STOP_RED)
-            .min_size(egui::vec2(150.0, 38.0));
-            if ui.add(parar).clicked() && clic_del_operador {
-                self.parar_todo();
-            }
+        let hay_algo = self.cuantos_activos() > 0;
+        let en_pausa = self.hay_pausa();
 
-            ui.add_space(16.0);
-            ui.label("Salida:");
-            egui::ComboBox::from_id_salt("salida")
-                .width(300.0)
-                .selected_text(
-                    self.salidas
-                        .get(self.elegida)
-                        .map(|s| s.name.clone())
-                        .unwrap_or_else(|| "—".to_string()),
-                )
-                .show_ui(ui, |ui| {
-                    for (i, s) in self.salidas.clone().iter().enumerate() {
-                        ui.selectable_value(&mut self.elegida, i, &s.name);
-                    }
-                });
-            if boton_icono(ui, IconKind::Probar, "Probar", None).clicked() && clic_del_operador {
-                self.probar_salida();
-            }
-
-            // Estado de lo que está sonando ahora mismo.
-            let sonando: Vec<String> = self
-                .entradas
-                .iter()
-                .filter(|e| e.sonando())
-                .map(|e| {
-                    let pos = e
-                        .pista
-                        .as_ref()
-                        .map(|p| p.position().as_secs_f32())
-                        .unwrap_or(0.0);
-                    format!("{} {:.1}s", e.nombre, pos)
-                })
-                .collect();
-
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if sonando.is_empty() {
-                    ui.label(egui::RichText::new("en silencio").color(FG_MUTE));
-                } else {
-                    ui.label(
-                        egui::RichText::new(format!("SONANDO: {}", sonando.join(" · ")))
-                            .color(GO_GREEN),
-                    );
+        // --- mandos: los tres gestos, para todo a la vez --------------------
+        //
+        // La fila se lleva un alto **fijo**, no el que le deje el panel. El
+        // resumen de la derecha va con `with_layout`, y `with_layout` se queda
+        // con todo el alto que encuentre: sin el tope, la fila crecía hasta el
+        // borde del panel, el separador y el aviso de abajo se salían por la
+        // ventana, y el panel central —que se pinta después— acababa tapando
+        // la mitad de arriba de los botones.
+        ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), ALTO_BOTON_MANDOS),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                // PLAY hace las dos cosas que se le pueden pedir —seguir si
+                // estaba en pausa, devolver los bucles si se había parado—, así
+                // que el icono es el mismo y lo que cambia es el tooltip. Con
+                // texto eran dos etiquetas distintas, y el ancho de las tres
+                // era justo lo que no cabía.
+                let play = BotonMandos::nuevo(
+                    IconKind::Play,
+                    if en_pausa {
+                        "Seguir donde se quedó"
+                    } else {
+                        "Reproducir"
+                    },
+                    GO_GREEN,
+                    egui::Color32::BLACK,
+                );
+                if ui.add(play).clicked() && clic_del_operador {
+                    self.reproducir();
                 }
-            });
-        });
+
+                let pausa = BotonMandos::nuevo(
+                    IconKind::Pausa,
+                    "Pausar todo",
+                    BG_ROW_ACTIVE,
+                    FG_STRONG,
+                );
+                if ui.add_enabled(hay_algo, pausa).clicked() && clic_del_operador {
+                    self.pausar_todo();
+                }
+
+                let parar =
+                    BotonMandos::nuevo(IconKind::Detener, "Parar todo", STOP_RED, FG_STRONG);
+                if ui.add(parar).clicked() && clic_del_operador {
+                    self.parar_todo();
+                }
+
+                ui.add_space(16.0);
+                ui.label("Salida:");
+                egui::ComboBox::from_id_salt("salida")
+                    .width(260.0)
+                    .selected_text(
+                        self.salidas
+                            .get(self.elegida)
+                            .map(|s| s.name.clone())
+                            .unwrap_or_else(|| "—".to_string()),
+                    )
+                    .show_ui(ui, |ui| {
+                        for (i, s) in self.salidas.clone().iter().enumerate() {
+                            ui.selectable_value(&mut self.elegida, i, &s.name);
+                        }
+                    });
+                if boton_icono(ui, IconKind::Probar, "Probar", None).clicked() && clic_del_operador {
+                    self.probar_salida();
+                }
+
+                // Resumen a la derecha: cuántas pistas y en qué estado, sin
+                // tener que contar filas.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let n = self.cuantos_activos();
+                    let (texto, color) = if n == 0 {
+                        ("en silencio".to_string(), FG_MUTE)
+                    } else if en_pausa {
+                        (format!("{n} en pausa"), WARN_AMBER)
+                    } else {
+                        (format!("{n} sonando"), GO_GREEN)
+                    };
+                    ui.label(egui::RichText::new(texto).color(color).strong());
+                });
+            },
+        );
+
+        ui.separator();
+        self.lista_activos(ui);
 
         if self.ver_registro {
             ui.separator();
@@ -2202,6 +3034,135 @@ impl App {
                         ui.monospace(egui::RichText::new(linea).color(FG_MUTE).size(11.0));
                     }
                 });
+        }
+    }
+
+    /// La lista de lo que suena ahora mismo: una fila por pista.
+    ///
+    /// La barra de envolvente es la respuesta a "¿el fade se está haciendo?".
+    /// No enseña el volumen configurado —eso no cambia mientras suena y no
+    /// diría nada—, sino la ganancia que el motor aplica **en esta muestra**.
+    /// Si sube poco a poco, la rampa va; si salta de vacío a lleno en una
+    /// sola fila, ese audio entra de golpe y no hay fade que valga, lo pida o
+    /// no su configuración.
+    fn lista_activos(&mut self, ui: &mut egui::Ui) {
+        let activos = self.activos();
+        if activos.is_empty() {
+            ui.add_space(6.0);
+            ui.vertical_centered(|ui| {
+                ui.label(egui::RichText::new("Nada sonando en este instante").color(FG_MUTE));
+            });
+            return;
+        }
+
+        let clic_del_operador = self.clic_fiable();
+        // La orden se apunta y se aplica al salir del bucle: dentro no se
+        // puede tocar `self`, que es de donde salen los nombres que se están
+        // pintando.
+        let mut orden: Option<(Objeto, Accion)> = None;
+
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                for a in &activos {
+                    let fila = egui::Frame::new()
+                        .fill(if a.pausado { BG_ROW_ALT } else { BG_ROW })
+                        .inner_margin(egui::Margin::symmetric(8, 3))
+                        .show(ui, |ui| {
+                            ui.set_min_height(ALTO_FILA_ACTIVO - 6.0);
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new("■").color(a.color).size(14.0));
+                                ui.label(
+                                    egui::RichText::new(&a.nombre)
+                                        .color(if a.pausado { WARN_AMBER } else { GO_GREEN })
+                                        .strong(),
+                                );
+
+                                barra_envolvente(ui, a.ganancia, a.pausado);
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "{:>3} %",
+                                        (a.ganancia * 100.0).round() as i32
+                                    ))
+                                    .color(FG_BASE)
+                                    .monospace()
+                                    .size(11.0),
+                                );
+
+                                if let Some(p) = a.pos {
+                                    let texto = match a.total {
+                                        Some(t) => {
+                                            format!("{} / {}", formato_mmss(p), formato_mmss(t))
+                                        }
+                                        None => formato_mmss(p),
+                                    };
+                                    ui.label(
+                                        egui::RichText::new(texto)
+                                            .color(FG_MUTE)
+                                            .monospace()
+                                            .size(11.0),
+                                    );
+                                }
+
+                                if a.bucle {
+                                    ui.label(egui::RichText::new("bucle").color(FG_MUTE).size(11.0));
+                                }
+                                if a.saliendo {
+                                    ui.label(
+                                        egui::RichText::new("saliendo").color(WARN_AMBER).size(11.0),
+                                    );
+                                }
+                                if a.pausado {
+                                    ui.label(
+                                        egui::RichText::new("EN PAUSA")
+                                            .color(WARN_AMBER)
+                                            .size(11.0)
+                                            .strong(),
+                                    );
+                                }
+
+                                // Los mandos de esta pista. El de salir lleva
+                                // su nombre de verdad —"SALIR", "CORTA" o
+                                // "PARAR"— porque una pista con fade out tarda
+                                // en irse y eso hay que saberlo antes de
+                                // pulsar, no después.
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        let salir =
+                                            boton_icono(ui, IconKind::Detener, a.rotulo_salida, None);
+                                        if salir.clicked() && clic_del_operador {
+                                            orden = Some((a.quien, Accion::Parar));
+                                        }
+                                        salir.on_hover_text(&a.ayuda_salida);
+
+                                        if a.pausado {
+                                            if boton_icono_chico(
+                                                ui,
+                                                IconKind::Play,
+                                                Some(GO_GREEN),
+                                            )
+                                            .clicked()
+                                                && clic_del_operador
+                                            {
+                                                orden = Some((a.quien, Accion::Seguir));
+                                            }
+                                        } else if boton_icono_chico(ui, IconKind::Pausa, None)
+                                            .clicked()
+                                            && clic_del_operador
+                                        {
+                                            orden = Some((a.quien, Accion::Pausar));
+                                        }
+                                    },
+                                );
+                            });
+                        });
+                    let _ = fila;
+                }
+            });
+
+        if let Some((quien, accion)) = orden {
+            self.aplicar_accion(quien, accion);
         }
     }
 
@@ -3210,6 +4171,11 @@ impl App {
             if evento.tipo.usa_fade() {
                 slider_porcentaje(ui, "Desde", &mut pista.desde_pct);
                 slider_porcentaje(ui, "Hasta", &mut pista.hasta_pct);
+                if let Some(aviso) = aviso_de_rampa_plana(pista.desde_pct, pista.hasta_pct) {
+                    ui.label(
+                        egui::RichText::new(aviso).color(WARN_AMBER).size(11.0).strong(),
+                    );
+                }
             }
             ui_volumen_pista(ui, pista);
             ui.add_space(6.0);
@@ -3690,6 +4656,28 @@ enum TipoTransicion {
     Baja,
 }
 
+/// Qué avisar cuando los dos extremos de la rampa son iguales.
+///
+/// Una rampa de 100 a 100 **no es una rampa**: es una entrada de golpe, con la
+/// duración y la curva puestas de adorno. Y una de 0 a 0 no suena nada. En los
+/// dos casos el panel sigue diciendo "con fade" mientras el audio hace otra
+/// cosa, que es justo el síntoma con el que el operador no entiende qué pasa:
+/// configuró un fade y el audio se coloca de golpe.
+///
+/// No se prohíbe —los dos extremos iguales y por encima de cero son una manera
+/// legítima de decir "entra ya a este nivel"—, pero no puede pasar en silencio.
+fn aviso_de_rampa_plana(desde: u8, hasta: u8) -> Option<&'static str> {
+    if desde != hasta {
+        return None;
+    }
+    Some(if hasta == 0 {
+        "Los dos extremos están en 0 %: así no suena nada, no hay rampa que hacer."
+    } else {
+        "Los dos extremos son iguales, así que no hay rampa: esto entra de golpe. \
+         Para que suba, baja el «Desde» por debajo del «Hasta»."
+    })
+}
+
 fn ui_transicion(ui: &mut egui::Ui, spec: &mut CueSpec) {
     let (mut desde, mut hasta, mut duracion, mut curva, clase_inicial) = match spec.entrance {
         Entrance::Hit => (100u8, 100u8, Duration::from_secs(3), Curve::Linear, TipoTransicion::Golpe),
@@ -3743,6 +4731,10 @@ fn ui_transicion(ui: &mut egui::Ui, spec: &mut CueSpec) {
 
     slider_porcentaje(ui, "Desde", &mut desde);
     slider_porcentaje(ui, "Hasta", &mut hasta);
+
+    if let Some(aviso) = aviso_de_rampa_plana(desde, hasta) {
+        ui.label(egui::RichText::new(aviso).color(WARN_AMBER).size(11.0).strong());
+    }
 
     ui.horizontal(|ui| {
         if ui.small_button("Invertir").clicked() {
@@ -4152,6 +5144,7 @@ fn resumir(spec: &CueSpec) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     /// La guarda del clic fantasma, que es fácil de romper sin darse cuenta.
     ///
@@ -4210,5 +5203,656 @@ mod tests {
                 }
             }
         }
+    }
+
+    // -----------------------------------------------------------------
+    // La zona de reproductor
+    // -----------------------------------------------------------------
+    //
+    // Aquí se prueba la **política** del transporte: quién se pausa, quién se
+    // para, y qué se apunta para después. Que el fade dure lo que dice y que
+    // la pausa congele la envolvente a medias se prueba aparte, contra la
+    // cadena de audio de verdad, en `tests/fade_en_vivo.rs`: eso es motor, y
+    // el motor no se puede comprobar con pistas de mentira.
+
+    /// Pista de mentira: no suena, pero obedece y se acuerda de lo que le
+    /// hicieron. Basta para comprobar a quién le llega cada orden.
+    struct PistaFalsa {
+        pausada: AtomicBool,
+        parada: AtomicBool,
+        /// Le pidieron bajar y cortarse al terminar, en vez de un corte seco.
+        ///
+        /// Se distinguen a propósito: es la diferencia entre que la salida
+        /// configurada en el inspector sirva de algo o no.
+        con_fade: AtomicBool,
+    }
+
+    impl PistaFalsa {
+        fn nueva() -> Self {
+            Self {
+                pausada: AtomicBool::new(false),
+                parada: AtomicBool::new(false),
+                con_fade: AtomicBool::new(false),
+            }
+        }
+    }
+
+    impl TrackHandle for PistaFalsa {
+        fn state(&self) -> TrackState {
+            if self.parada.load(Ordering::SeqCst) {
+                TrackState::Stopped
+            } else if self.con_fade.load(Ordering::SeqCst) {
+                TrackState::FadingOut
+            } else if self.pausada.load(Ordering::SeqCst) {
+                TrackState::Paused
+            } else {
+                TrackState::Playing
+            }
+        }
+        fn position(&self) -> Duration {
+            Duration::from_secs(7)
+        }
+        fn duration(&self) -> Option<Duration> {
+            None
+        }
+        fn set_gain(&self, _gain: f32) {}
+        fn fade_to(&self, _gain: f32, _d: Duration, _c: Curve) {}
+        fn fade_out(&self, _d: Duration, _c: Curve) {}
+        fn stop_after(&self, _d: Duration, _c: Curve) {
+            self.con_fade.store(true, Ordering::SeqCst);
+        }
+        fn pause(&self) {
+            self.pausada.store(true, Ordering::SeqCst);
+        }
+        fn resume(&self) {
+            self.pausada.store(false, Ordering::SeqCst);
+        }
+        fn is_paused(&self) -> bool {
+            self.pausada.load(Ordering::SeqCst)
+        }
+        fn gain(&self) -> f32 {
+            0.5
+        }
+        fn stop(&self) {
+            self.parada.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Una entrada con una pista ya montada, o sin pista si no suena.
+    fn entrada_de_prueba(nombre: &str, bucle: LoopMode, suena: bool) -> Entrada {
+        Entrada {
+            nombre: nombre.to_string(),
+            spec: CueSpec { loop_mode: bucle, ..CueSpec::simple() },
+            color: 0,
+            pista: suena.then(|| Box::new(PistaFalsa::nueva()) as Box<dyn TrackHandle>),
+            duck: false,
+            fuente: Fuente::Archivo(PathBuf::from("no-existe.wav")),
+            audio: AudioRef::default(),
+            auto_follow: AutoFollow::None,
+            tecla: None,
+            pad: false,
+            falta: false,
+        }
+    }
+
+    /// Un evento con su único hueco ya montado, o sin pista si no suena.
+    fn evento_de_prueba(nombre: &str, bucle: i32, suena: bool) -> EventoVivo {
+        let mut evento = Evento::nuevo(TipoEvento::FadeIn);
+        evento.nombre = nombre.to_string();
+        evento.bucle = bucle;
+        evento.pistas[0] = PistaEvento::vacia(0, 100).con_audio(
+            "ambiente",
+            AudioRef { file_name: "ambiente.wav".to_string(), ..Default::default() },
+        );
+        let mut vivo = EventoVivo::nuevo(evento);
+        if suena {
+            vivo.pistas[0] = Some(Box::new(PistaFalsa::nueva()));
+        }
+        vivo
+    }
+
+    /// Lo que se anotó en el registro a partir de un punto.
+    fn dicho_desde(app: &App, desde: usize) -> String {
+        app.registro[desde.min(app.registro.len())..].join(" | ")
+    }
+
+    /// GO sobre un audio que ya suena no lo apila: lo avisa y no hace nada.
+    ///
+    /// Es el "eco irregular" que describió el usuario. Si el audio va por el
+    /// segundo 20 y se le vuelve a dar a GO, lo que se oía era el mismo audio
+    /// en el segundo 0 y en el 20 a la vez, y repitiendo el gesto se apilaban
+    /// tantas copias que aquello dejaba de ser una función.
+    #[test]
+    fn un_audio_no_se_dispara_sobre_si_mismo() {
+        let mut app = App::new();
+        app.entradas.push(entrada_de_prueba("ambiente", LoopMode::Infinite, true));
+        let antes = app.registro.len();
+
+        app.ir(0);
+
+        let dicho = dicho_desde(&app, antes);
+        assert!(dicho.contains("ya está sonando"), "debería avisar: {dicho}");
+        // Y lo que importa: no se ha intentado reproducir nada. Si hubiera
+        // seguido adelante, el motor habría fallado al abrir "no-existe.wav".
+        assert!(
+            !dicho.contains("no se pudo reproducir"),
+            "no debe llegar a intentarlo: {dicho}"
+        );
+        assert!(app.entradas[0].sonando(), "la pista que sonaba sigue siendo la misma");
+    }
+
+    /// Un audio en pausa tampoco se apila: el aviso lo dice tal cual.
+    #[test]
+    fn un_audio_en_pausa_tampoco_se_apila() {
+        let mut app = App::new();
+        app.entradas.push(entrada_de_prueba("ambiente", LoopMode::Infinite, true));
+        app.pausar_todo();
+        let antes = app.registro.len();
+
+        app.ir(0);
+
+        let dicho = dicho_desde(&app, antes);
+        assert!(dicho.contains("ya está en pausa"), "{dicho}");
+        assert!(!dicho.contains("no se pudo reproducir"), "{dicho}");
+    }
+
+    /// El mismo archivo no suena dos veces ni cruzando las dos listas.
+    ///
+    /// Un audio puede estar sonando como fila de la lista o dentro de un evento.
+    /// El caso que se colaba es este: un evento lleva su propia pista, así que
+    /// la fila de la lista no sabe nada de él y las dos copias del mismo archivo
+    /// convivirían sin enterarse. La identidad es el archivo, así que la
+    /// comprobación tiene que mirar las dos listas.
+    #[test]
+    fn el_mismo_archivo_no_suena_dos_veces_ni_cruzando_listas() {
+        let mut app = App::new();
+        // La fila apunta al mismo archivo que el hueco del evento.
+        let mut fila = entrada_de_prueba("ambiente", LoopMode::Infinite, false);
+        fila.audio.file_name = "ambiente.wav".to_string();
+        app.entradas.push(fila);
+        // `evento_de_prueba` usa "ambiente.wav", y está sonando.
+        app.eventos.push(evento_de_prueba("escena", BUCLE_INFINITO, true));
+        let antes = app.registro.len();
+
+        app.ir(0);
+
+        let dicho = dicho_desde(&app, antes);
+        assert!(dicho.contains("escena"), "debería decir quién lo tiene: {dicho}");
+        assert!(!dicho.contains("no se pudo reproducir"), "{dicho}");
+        assert!(!app.entradas[0].sonando(), "no se ha montado una segunda copia");
+    }
+
+    /// Y al revés: el evento no se lanza si su audio ya suena como fila.
+    #[test]
+    fn el_evento_no_se_lanza_si_su_audio_ya_suena() {
+        let mut app = App::new();
+        let mut fila = entrada_de_prueba("ambiente", LoopMode::Infinite, true);
+        fila.audio.file_name = "ambiente.wav".to_string();
+        app.entradas.push(fila);
+        app.eventos.push(evento_de_prueba("escena", BUCLE_INFINITO, false));
+        let antes = app.registro.len();
+
+        app.ir_evento(0);
+
+        let dicho = dicho_desde(&app, antes);
+        assert!(dicho.contains("no monta una segunda copia"), "{dicho}");
+        assert!(!app.eventos[0].sonando(), "el evento no se ha montado");
+    }
+
+    /// Relanzar un evento que ya suena sigue permitido: se reinicia.
+    ///
+    /// La exclusión del propio evento dentro de `donde_suena` es justo lo que
+    /// hace que esto funcione. Sin ella el evento se encontraría a sí mismo, se
+    /// bloquearía, y no habría forma de repetir una escena.
+    #[test]
+    fn un_evento_se_puede_relanzar_a_si_mismo() {
+        let mut app = App::new();
+        app.eventos.push(evento_de_prueba("escena", BUCLE_INFINITO, true));
+        let antes = app.registro.len();
+
+        app.ir_evento(0);
+
+        let dicho = dicho_desde(&app, antes);
+        assert!(!dicho.contains("segunda copia"), "no debe bloquearse a sí mismo: {dicho}");
+        // Ha llegado hasta el final: monta la escena y sólo se atasca en que el
+        // audio no está en la lista, que en este test es lo esperado.
+        assert!(dicho.contains("FALTA EL AUDIO"), "{dicho}");
+    }
+
+    /// Al parar se apuntan los bucles, y **sólo** los bucles.
+    ///
+    /// Es la regla que pidió el usuario: si se paró en mitad de un efecto de
+    /// una sola pasada, PLAY devuelve los ambientes que sonaban en bucle, no
+    /// el efecto. Repetir un trueno al reanudar sería un susto, no una
+    /// reanudación.
+    #[test]
+    fn al_parar_solo_se_apuntan_los_bucles() {
+        let mut app = App::new();
+        app.entradas.push(entrada_de_prueba("ambiente", LoopMode::Infinite, true));
+        app.entradas.push(entrada_de_prueba("trueno", LoopMode::None, true));
+        // Un bucle que no está sonando no se apunta: no hay qué devolver.
+        app.entradas.push(entrada_de_prueba("otro ambiente", LoopMode::Infinite, false));
+        app.eventos.push(evento_de_prueba("escena", BUCLE_INFINITO, true));
+        app.eventos.push(evento_de_prueba("remate", 1, true));
+
+        app.parar_todo();
+
+        assert_eq!(app.reanudables.len(), 2, "los dos bucles que estaban sonando");
+        assert!(matches!(app.reanudables[0], Objeto::Audio(0)));
+        assert!(matches!(app.reanudables[1], Objeto::Evento(0)));
+        assert_eq!(app.cuantos_activos(), 0, "al parar no queda nada montado");
+    }
+
+    /// PAUSA no pierde nada: todo sigue montado y vuelve donde estaba.
+    ///
+    /// La diferencia con PARAR es que aquí no hay que apuntar nada para
+    /// después, porque no hace falta: la pista sigue ahí, congelada.
+    #[test]
+    fn la_pausa_no_pierde_lo_que_la_parada_pierde() {
+        let mut app = App::new();
+        app.entradas.push(entrada_de_prueba("ambiente", LoopMode::Infinite, true));
+        app.entradas.push(entrada_de_prueba("trueno", LoopMode::None, true));
+
+        app.pausar_todo();
+
+        assert!(app.hay_pausa(), "las dos quedan congeladas");
+        assert!(app.entradas[0].pausada() && app.entradas[1].pausada());
+        // El efecto de una sola pasada sigue montado: la pausa no lo tira.
+        assert_eq!(app.cuantos_activos(), 2);
+        assert!(app.reanudables.is_empty(), "la pausa no necesita apuntar nada");
+
+        app.reproducir();
+
+        assert!(!app.hay_pausa(), "PLAY las descongela");
+        assert!(app.entradas[0].sonando() && app.entradas[1].sonando());
+    }
+
+    /// PLAY tras una parada sin bucles no se inventa nada.
+    #[test]
+    fn play_sin_bucles_apuntados_no_reanuda_nada() {
+        let mut app = App::new();
+        app.entradas.push(entrada_de_prueba("trueno", LoopMode::None, true));
+        app.parar_todo();
+        let antes = app.registro.len();
+
+        app.reproducir();
+
+        assert!(dicho_desde(&app, antes).contains("no hay nada que reanudar"));
+        assert_eq!(app.cuantos_activos(), 0);
+    }
+
+    /// La memoria de STOP se gasta al usarla: un segundo PLAY no vuelve a
+    /// montar los mismos bucles encima de sí mismos.
+    #[test]
+    fn la_memoria_de_la_parada_se_gasta() {
+        let mut app = App::new();
+        app.entradas.push(entrada_de_prueba("ambiente", LoopMode::Infinite, true));
+        app.parar_todo();
+        assert_eq!(app.reanudables.len(), 1);
+
+        // Reanuda de verdad: el archivo no existe, así que el motor fallará,
+        // pero la memoria se gasta igual. Es justo lo que hay que comprobar.
+        app.reproducir();
+        assert!(app.reanudables.is_empty(), "ya se ha usado");
+
+        let antes = app.registro.len();
+        app.reproducir();
+        assert!(dicho_desde(&app, antes).contains("no hay nada que reanudar"));
+    }
+
+    /// Los mandos de una fila tocan sólo esa fila.
+    #[test]
+    fn el_mando_de_una_fila_no_toca_las_demas() {
+        let mut app = App::new();
+        app.entradas.push(entrada_de_prueba("ambiente", LoopMode::Infinite, true));
+        app.entradas.push(entrada_de_prueba("musica", LoopMode::Infinite, true));
+
+        app.aplicar_accion(Objeto::Audio(1), Accion::Pausar);
+
+        assert!(!app.entradas[0].pausada(), "el ambiente no se toca");
+        assert!(app.entradas[1].pausada(), "la música sí");
+
+        app.aplicar_accion(Objeto::Audio(0), Accion::Parar);
+
+        assert!(!app.entradas[0].sonando(), "parada de verdad");
+        assert!(app.entradas[1].sonando(), "y la otra sigue en pausa, no parada");
+        assert!(app.entradas[1].pausada());
+    }
+
+    /// La zona de reproductor enseña lo que suena, incluido lo congelado.
+    #[test]
+    fn la_lista_de_activos_incluye_lo_congelado() {
+        let mut app = App::new();
+        app.entradas.push(entrada_de_prueba("ambiente", LoopMode::Infinite, true));
+        app.entradas.push(entrada_de_prueba("trueno", LoopMode::None, false));
+        app.eventos.push(evento_de_prueba("escena", BUCLE_INFINITO, true));
+
+        app.pausar_todo();
+        let activos = app.activos();
+
+        assert_eq!(activos.len(), 2, "el que no suena no sale");
+        assert!(activos.iter().all(|a| a.pausado), "y se ve que están en pausa");
+        assert!(activos.iter().any(|a| a.bucle), "el ambiente va en bucle");
+        assert!(matches!(activos[0].quien, Objeto::Audio(0)));
+        assert!(matches!(activos[1].quien, Objeto::Evento(0)));
+    }
+
+    /// El panel de reproductor crece con lo que suena y nunca se come la lista.
+    #[test]
+    fn el_alto_del_reproductor_crece_y_tiene_tope() {
+        let mut app = App::new();
+        // Una ventana de las normales: manda el tope del propio panel.
+        const VENTANA: f32 = 1080.0;
+        assert_eq!(app.alto_transporte(VENTANA), ALTO_MANDOS, "en silencio, lo mínimo");
+
+        app.entradas.push(entrada_de_prueba("uno", LoopMode::Infinite, true));
+        let con_uno = app.alto_transporte(VENTANA);
+        app.entradas.push(entrada_de_prueba("dos", LoopMode::Infinite, true));
+        assert!(app.alto_transporte(VENTANA) > con_uno, "cada pista añade su fila");
+
+        // Muchas pistas a la vez: el panel se planta y la lista hace scroll,
+        // porque si no se comería la lista central.
+        for i in 0..20 {
+            app.entradas.push(entrada_de_prueba(&format!("más {i}"), LoopMode::Infinite, true));
+        }
+        assert_eq!(app.alto_transporte(VENTANA), ALTO_TRANSPORTE_MAX);
+
+        // En una pantalla baja manda la ventana: un tercio, y ni un píxel más.
+        assert_eq!(app.alto_transporte(600.0), 200.0);
+        assert!(app.alto_transporte(600.0) < ALTO_TRANSPORTE_MAX);
+        // Y por muy pequeña que sea, los mandos caben: el panel nunca baja del
+        // mínimo, que es lo que evita que `clamp` reciba un rango invertido.
+        assert_eq!(app.alto_transporte(120.0), ALTO_MANDOS);
+    }
+
+    /// La zona de reproductor se pinta entera sin reventar.
+    ///
+    /// Es un test de humo: no juzga el aspecto —eso hay que verlo—, pero sí
+    /// recorre el camino de pintado con datos de verdad (un bucle sonando, un
+    /// efecto, un evento, y luego todo congelado) y comprueba que no se sale de
+    /// ningún índice ni peta al dibujar. Es lo único que toca ese código: un
+    /// panel que revienta al pintarse deja la ventana en negro, y eso no lo ve
+    /// ningún otro test.
+    #[test]
+    fn la_zona_de_reproductor_se_pinta_entera() {
+        let mut app = App::new();
+        app.entradas.push(entrada_de_prueba("ambiente", LoopMode::Infinite, true));
+        app.entradas.push(entrada_de_prueba("trueno", LoopMode::None, false));
+        app.eventos.push(evento_de_prueba("escena", BUCLE_INFINITO, true));
+
+        egui::__run_test_ui(|ui| app.transporte(ui));
+
+        // Y la otra rama de cada fila: con la pista congelada, que pinta la
+        // barra en ámbar y cambia el botón de pausa por el de seguir.
+        app.pausar_todo();
+        egui::__run_test_ui(|ui| app.transporte(ui));
+    }
+
+    /// Los mandos caben en el panel: ni se recortan ni se cuelan por encima.
+    ///
+    /// Es el fallo que se vio en pantalla. Con las tres etiquetas de texto, la
+    /// fila de mandos pedía más alto del que el panel tenía, y un panel
+    /// `exact_size` al que le falta un píxel no avisa: recorta. Y encima
+    /// engaña, porque egui reancla el panel a su borde de abajo cuando el
+    /// contenido no cabe, le deja el hueco de más al panel central, y el panel
+    /// central —que se pinta después— tapa la mitad de arriba de los botones.
+    ///
+    /// El test mide las dos mitades del síntoma sobre un egui de verdad, no a
+    /// ojo: que el contenido quepa en el panel, y que el borde de arriba del
+    /// panel sea el que toca (si se reancla, baja).
+    #[test]
+    fn los_mandos_caben_en_el_panel() {
+        const VENTANA: f32 = 720.0;
+        const BARRA: f32 = 46.0;
+
+        // Las dos formas que tiene el panel de llenarse: el aviso de "nada
+        // sonando" cuando está vacío, y la lista cuando hay pistas.
+        for pistas in [0, 1, 3] {
+            let mut app = App::new();
+            for i in 0..pistas {
+                app.entradas.push(entrada_de_prueba(
+                    &format!("pista {i}"),
+                    LoopMode::Infinite,
+                    true,
+                ));
+            }
+
+            let ctx = egui::Context::default();
+            aplicar_paleta(&ctx);
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(1280.0, VENTANA),
+                )),
+                ..Default::default()
+            };
+
+            let mut contenido = 0.0_f32;
+            let mut hueco = 0.0_f32;
+            let mut borde = 0.0_f32;
+            let mut alto = 0.0_f32;
+            // Dos pasadas: la primera deja el estado de los paneles, y con él
+            // se mide igual que en la ventana de verdad.
+            for _ in 0..2 {
+                let mut salida = ctx.run_ui(raw.clone(), |ui| {
+                    egui::Panel::top("barra").exact_size(BARRA).show(ui, |_ui| {});
+                    alto = app.alto_transporte(ui.available_height());
+                    let r = egui::Panel::bottom("transporte")
+                        .exact_size(alto)
+                        .show(ui, |ui| {
+                            let arriba = ui.max_rect().top();
+                            hueco = ui.max_rect().height();
+                            app.transporte(ui);
+                            contenido = ui.min_rect().bottom() - arriba;
+                        });
+                    borde = r.response.rect.top();
+                });
+                salida.textures_delta.clear();
+            }
+
+            assert!(
+                contenido <= hueco,
+                "con {pistas} pistas, el contenido ({contenido:.1}) no cabe en el hueco del panel ({hueco:.1}): se recorta"
+            );
+            assert_eq!(
+                borde,
+                VENTANA - alto,
+                "con {pistas} pistas el panel se ha reanclado hacia abajo: el central le pintará encima"
+            );
+        }
+    }
+
+    /// Una rampa plana se avisa; una de verdad, no.
+    ///
+    /// Es la trampa que produce el síntoma exacto que reportó el usuario: con
+    /// los dos extremos iguales el panel sigue diciendo "con fade" mientras el
+    /// audio se coloca de golpe. El aviso es lo único que lo delata.
+    #[test]
+    fn la_rampa_plana_se_avisa() {
+        // Rampas de verdad: ni palabra.
+        assert!(aviso_de_rampa_plana(0, 100).is_none());
+        assert!(aviso_de_rampa_plana(100, 0).is_none());
+        assert!(aviso_de_rampa_plana(20, 60).is_none());
+        assert!(aviso_de_rampa_plana(60, 20).is_none());
+
+        // Planas: aviso, y distinguiendo el silencio de la entrada de golpe.
+        let golpe = aviso_de_rampa_plana(100, 100).expect("100→100 no es una rampa");
+        assert!(golpe.contains("de golpe"), "{golpe}");
+        assert!(aviso_de_rampa_plana(60, 60).is_some(), "60→60 tampoco es rampa");
+        let mudo = aviso_de_rampa_plana(0, 0).expect("0→0 no suena");
+        assert!(mudo.contains("no suena"), "{mudo}");
+    }
+
+    /// El botón de salir obedece a la salida configurada en el inspector.
+    ///
+    /// Es `FR-04`, que estaba sin implementar: la sección "Cómo sale" se podía
+    /// configurar entera y **no la leía nadie**, así que poner "Sale con fade
+    /// out" y que el audio se cortara igual era lo normal.
+    #[test]
+    fn la_salida_obedece_lo_que_diga_el_inspector() {
+        let mut app = App::new();
+        // Sin tocar nada, la salida por defecto es cortar ya.
+        app.entradas.push(entrada_de_prueba("ambiente", LoopMode::Infinite, true));
+        app.aplicar_accion(Objeto::Audio(0), Accion::Parar);
+        assert_eq!(
+            app.entradas[0].estado(),
+            Some(TrackState::Stopped),
+            "por defecto corta"
+        );
+
+        // Con "Sale con fade out", se le pide el fade y el corte al terminar,
+        // en vez del corte seco.
+        let mut con_fade = entrada_de_prueba("musica", LoopMode::Infinite, true);
+        con_fade.spec.exit =
+            ExitMode::FadeOut { duration: Duration::from_secs(2), curve: Curve::Linear };
+        app.entradas.push(con_fade);
+
+        app.aplicar_accion(Objeto::Audio(1), Accion::Parar);
+
+        assert_eq!(
+            app.entradas[1].estado(),
+            Some(TrackState::FadingOut),
+            "debe estar bajando, no cortada"
+        );
+        assert!(app.entradas[1].sonando(), "y sigue sonando mientras baja");
+    }
+
+    /// El botón dice lo que va a hacer, no siempre lo mismo.
+    ///
+    /// Una pista con fade out tarda en irse: eso hay que saberlo **antes** de
+    /// pulsar, no después.
+    #[test]
+    fn el_boton_de_salir_se_llama_segun_lo_que_hace() {
+        let mut e = entrada_de_prueba("x", LoopMode::Infinite, true);
+        assert_eq!(e.rotulo_salida(), "PARAR", "sin salida configurada, corta");
+        assert!(e.ayuda_salida().contains("corta ya"));
+
+        e.spec.exit = ExitMode::Hit;
+        assert_eq!(e.rotulo_salida(), "CORTA");
+
+        e.spec.exit =
+            ExitMode::FadeOut { duration: Duration::from_secs(2), curve: Curve::Linear };
+        assert_eq!(e.rotulo_salida(), "SALIR");
+        assert!(
+            e.ayuda_salida().contains("2.00 s"),
+            "el tooltip dice cuánto tarda: {}",
+            e.ayuda_salida()
+        );
+    }
+
+    /// Un crossfade baja lo que esté sonando, **venga de donde venga**.
+    ///
+    /// El bug: `bajar_lo_que_suena` sólo miraba `self.entradas` y se saltaba
+    /// `self.eventos`. Así, si el audio que sonaba fue lanzado por un evento
+    /// (un FadeIn, por ejemplo), el crossfade no lo bajaba: el ambiente seguía
+    /// sonando encima del cambio de escena, y no se detenía al llegar a 0 %.
+    /// Es justo el "no pasa" que reportó el usuario.
+    #[test]
+    fn el_crossfade_baja_las_pistas_de_los_eventos() {
+        let mut app = App::new();
+
+        // Un ambiente lanzado por un FadeIn, sonando.
+        app.eventos.push(evento_de_prueba("Ambiente", BUCLE_INFINITO, true));
+
+        // Un crossfade que entra con otro audio distinto y apaga lo que suena.
+        let mut cross = Evento::nuevo(TipoEvento::Crossfade);
+        cross.nombre = "Cambio".to_string();
+        cross.pistas[0] = PistaEvento::vacia(0, 100)
+            .con_audio("Viento", AudioRef { file_name: "viento.wav".to_string(), ..Default::default() });
+        cross.salida_pct = 0; // apaga lo que suena
+        app.eventos.push(EventoVivo::nuevo(cross));
+
+        let antes = app.registro.len();
+        app.ir_evento(1); // lanza el crossfade
+
+        let dicho = dicho_desde(&app, antes);
+
+        // La pista del FadeIn debe haber recibido stop_after: su estado es
+        // FadingOut, no Playing. Antes del fix seguía en Playing.
+        let pista = app.eventos[0].pistas[0]
+            .as_ref()
+            .expect("la pista del FadeIn sigue montada");
+        assert_eq!(
+            pista.state(),
+            TrackState::FadingOut,
+            "el ambiente del evento debe estar saliendo con fade, no seguir sonando"
+        );
+
+        // Y el registro lo cuenta.
+        assert!(
+            dicho.contains("1 pista"),
+            "debe contar 1 pista bajada: {dicho}"
+        );
+    }
+
+    /// Y también las de la lista principal: un crossfade baja las pistas que
+    /// están sonando como filas, no sólo las de los eventos.
+    #[test]
+    fn el_crossfade_tambien_baja_las_pistas_de_la_lista() {
+        let mut app = App::new();
+
+        // Un audio sonando desde la lista principal.
+        app.entradas.push(entrada_de_prueba("ambiente", LoopMode::Infinite, true));
+
+        // Un crossfade que entra con otro audio distinto y apaga lo que suena.
+        let mut cross = Evento::nuevo(TipoEvento::Crossfade);
+        cross.nombre = "Cambio".to_string();
+        cross.pistas[0] = PistaEvento::vacia(0, 100)
+            .con_audio("Viento", AudioRef { file_name: "viento.wav".to_string(), ..Default::default() });
+        cross.salida_pct = 0;
+        app.eventos.push(EventoVivo::nuevo(cross));
+
+        let antes = app.registro.len();
+        app.ir_evento(0);
+
+        let dicho = dicho_desde(&app, antes);
+
+        assert_eq!(
+            app.entradas[0].estado(),
+            Some(TrackState::FadingOut),
+            "la pista de la lista debe estar saliendo con fade"
+        );
+        assert!(
+            dicho.contains("1 pista"),
+            "debe contar 1 pista bajada: {dicho}"
+        );
+    }
+
+    /// Un fade out de evento también tiene que bajar las pistas de eventos,
+    /// no sólo las de la lista. Es el mismo código (`bajar_lo_que_suena`).
+    #[test]
+    fn el_fade_out_de_evento_baja_las_pistas_de_los_eventos() {
+        let mut app = App::new();
+
+        // Dos eventos sonando: un bucle y un efecto.
+        app.eventos.push(evento_de_prueba("Ambiente", BUCLE_INFINITO, true));
+        app.eventos.push(evento_de_prueba("Trueno", 1, true));
+
+        // Un fade out que apaga lo que suena.
+        let mut fout = Evento::nuevo(TipoEvento::FadeOut);
+        fout.nombre = "Telón".to_string();
+        fout.salida_pct = 0;
+        app.eventos.push(EventoVivo::nuevo(fout));
+
+        let antes = app.registro.len();
+        app.ir_evento(2); // lanza el fade out
+
+        let dicho = dicho_desde(&app, antes);
+
+        // Las dos pistas de eventos deben estar saliendo con fade.
+        for (i, nombre) in ["Ambiente", "Trueno"].iter().enumerate() {
+            let pista = app.eventos[i].pistas[0]
+                .as_ref()
+                .unwrap_or_else(|| panic!("la pista de {nombre} sigue montada"));
+            assert_eq!(
+                pista.state(),
+                TrackState::FadingOut,
+                "la pista de {nombre} debe estar saliendo con fade"
+            );
+        }
+        assert!(
+            dicho.contains("2 pista"),
+            "debe contar 2 pistas bajadas: {dicho}"
+        );
     }
 }

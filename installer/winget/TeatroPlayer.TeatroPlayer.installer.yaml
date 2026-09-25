@@ -12,7 +12,7 @@ Installers:
   - Architecture: x64
     InstallerType: nsis
     InstallerUrl: https://github.com/AlexandreInking/TeatroPlayer/releases/download/v0.3.0/TeatroPlayer-Instalador.exe
-    InstallerSha256: D77A1BC7E41D33119B3698A27470050672EB63505BF0BA02D35D61862242591F
+    InstallerSha256: 05744A3D08F0537B99C23FD9E10C39A6FB0F3374EDDA9922C381619DFFB60ECD
     Scope: user
     InstallModes:
       - silent

@@ -12,6 +12,10 @@ que el ejecutable necesita y nada que dependa de esta máquina**:
 
 No incluye `logs/` ni `state.json`: los crea la app al arrancar.
 
+El ZIP sale a `dist\`, no a `target\`: `cargo clean` borra `target\` entero y se
+llevaría por delante el paquete listo para repartir. `dist\` está en
+`.gitignore`, así que el ZIP tampoco entra al repositorio.
+
 `portable.txt` **no cambia el comportamiento del programa**, y conviene no
 prometer lo contrario: la app es portable por diseño y escribe siempre junto al
 ejecutable (`Estado::ruta()` y `diagnostico::carpeta_logs()`), nunca en
@@ -66,7 +70,7 @@ en vez de esta versión: es lo único que registra la asociación.
 
 def main():
     salida = sys.argv[1] if len(sys.argv) > 1 else os.path.join(
-        "target", "release", "TeatroPlayer-portable.zip")
+        "dist", "TeatroPlayer-portable.zip")
 
     exe = os.path.join(RAIZ, EXE)
     if not os.path.isfile(exe):
@@ -87,6 +91,9 @@ def main():
             return 1
 
     print(f"generando {salida}")
+    # `dist\` puede no existir en un clon recién hecho: se crea, en vez de
+    # fallar con un error de ruta que no dice nada.
+    os.makedirs(os.path.dirname(os.path.abspath(salida)), exist_ok=True)
     with zipfile.ZipFile(salida, "w", zipfile.ZIP_DEFLATED) as z:
         z.write(exe, "TeatroPlayer.exe")
         z.writestr("portable.txt", PORTABLE)

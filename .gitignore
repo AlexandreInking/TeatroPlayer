@@ -1,6 +1,10 @@
 # Compilación
 /target/
 
+# Paquetes para repartir (instalador y ZIP portable). Se generan con
+# scripts/publicar.ps1; no son código y no entran al repositorio.
+/dist/
+
 # Registros y temporales (la app los crea al lado del ejecutable)
 /logs/
 *.log
