@@ -23,6 +23,26 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# Corre un comando nativo sin que su stderr se lleve por delante el script.
+#
+# `$ErrorActionPreference = "Stop"` convierte en error **fatal** cualquier linea
+# que un .exe escriba por stderr en cuanto se redirige con `2>&1`. Cargo escribe
+# ahi sus avisos, y uno de ellos sale de vez en cuando en Windows sin que nada
+# este roto: "error copying object file ... Acceso denegado (os error 5)" al
+# tocar `target/debug/incremental`. Con eso el script se plantaba en el primer
+# paso, por un aviso que no impide publicar nada. Lo que decide si hay que
+# parar es el codigo de salida, que se sigue mirando con `$LASTEXITCODE`.
+function Invoke-Nativo {
+    param([scriptblock]$Comando)
+    $previo = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        & $Comando
+    } finally {
+        $ErrorActionPreference = $previo
+    }
+}
+
 $raiz = Split-Path -Parent $PSScriptRoot
 Set-Location $raiz
 
@@ -49,12 +69,16 @@ if ($fallos.Count -gt 0) {
 
 # --- 1. tests antes de nada --------------------------------------------------
 Write-Host "[1/5] tests..."
-& $cargo test --workspace 2>&1 | Select-String -Pattern "^test result" | ForEach-Object { Write-Host "      $_" }
+Invoke-Nativo {
+    & $cargo test --workspace 2>&1 |
+        Select-String -Pattern "^test result" |
+        ForEach-Object { Write-Host "      $_" }
+}
 if ($LASTEXITCODE -ne 0) { Write-Host "FALLO: los tests no pasan. No se publica."; exit 1 }
 
 # --- 2. ejecutable de release ------------------------------------------------
 Write-Host "[2/5] compilando release..."
-& $cargo build --release
+Invoke-Nativo { & $cargo build --release }
 if ($LASTEXITCODE -ne 0) { Write-Host "FALLO: no compila."; exit 1 }
 
 $exe = "target\release\teatroplayer.exe"
@@ -65,7 +89,7 @@ Write-Host "      $exe ($tam MB)"
 Write-Host "[3/5] aviso de terceros..."
 $about = (Get-Command cargo-about -ErrorAction SilentlyContinue).Source
 if ($about) {
-    & $cargo about generate about.hbs -o THIRD-PARTY.html
+    Invoke-Nativo { & $cargo about generate about.hbs -o THIRD-PARTY.html }
     if ($LASTEXITCODE -eq 0) { Write-Host "      THIRD-PARTY.html" }
     else { Write-Host "      AVISO: cargo-about fallo" }
 } else {
